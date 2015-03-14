@@ -21,15 +21,15 @@ endif
 
 ifneq ($(ver), debug)
 $(warning "Use 'make ver=debug' to build for gdb debug.")
-CC = gcc
+CC = gcc -D_FILE_OFFSET_BITS=64
 else
-CC = gcc -g -DDEBUG -D_DEBUG
+CC = gcc -g -D_FILE_OFFSET_BITS=64 -DDEBUG -D_DEBUG
 endif
 
-all: pre version.h bin/libpcs.a bin/pcs
+all: bin/libpcs.a bin/pcs
 
-bin/pcs : bin/libpcs.a $(SHELL_OBJS)
-	$(CC) -o $@ $(SHELL_OBJS) $(CCFLAGS) $(CYGWIN_CCFLAGS) $(APPLE_CCFLAGS) -L./bin -lpcs -lm -lcurl -lssl -lcrypto
+bin/pcs : version pre bin/libpcs.a $(SHELL_OBJS)
+	$(CC) -o $@ $(SHELL_OBJS) $(CCFLAGS) $(CYGWIN_CCFLAGS) $(APPLE_CCFLAGS) -L./bin -lpcs -lm -lcurl -lssl -lcrypto -lpthread
 
 version.h:
 	bash ver.sh
@@ -50,8 +50,8 @@ bin/rb_tree_stack.o: rb_tree/stack.c rb_tree/stack.h
 bin/red_black_tree.o: rb_tree/red_black_tree.c rb_tree/red_black_tree.h
 	$(CC) -o $@ -c $(PCS_CCFLAGS) rb_tree/red_black_tree.c
 
-bin/libpcs.a : $(PCS_OBJS)
-	$(AR) crv $@ $^
+bin/libpcs.a : pre $(PCS_OBJS)
+	$(AR) crv $@ $(PCS_OBJS)
 
 bin/cJSON.o: pcs/cJSON.c pcs/cJSON.h
 	$(CC) -o $@ -c $(PCS_CCFLAGS) pcs/cJSON.c
@@ -82,3 +82,6 @@ clean :
 pre :
 	mkdir -p bin/
 
+.PHONY : version
+version:
+	bash ver.sh

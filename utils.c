@@ -22,6 +22,7 @@
 
 #if defined(WIN32)
 # define snprintf _snprintf
+# define vsnprintf _vsnprintf
 #endif
 
 
@@ -525,7 +526,16 @@ char *base_dir(const char *path, int len)
 		}
 		p[1] = '\0';
 	}
-	*p = '\0';
+	else {
+#ifdef _WIN32
+		if (*(p - 1) == ':' && ((p - dir) == 2))
+			*(p + 1) = '\0';
+		else
+			*p = '\0';
+#else
+		*p = '\0';
+#endif
+	}
 	return dir;
 }
 

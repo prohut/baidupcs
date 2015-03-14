@@ -11,6 +11,7 @@
   with these routines reserved for higher performance on data known to be
   valid.
 */
+#include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include <stdint.h>
 typedef uint32_t u_int32_t;
 #define snprintf _snprintf
+#define vsnprintf _vsnprintf
 #else
 #include <alloca.h>
 #endif
@@ -509,20 +511,28 @@ int u8_vprintf(const char *fmt, va_list ap)
     int cnt, sz=0;
     char *buf;
     wchar_t *wcs;
+	va_list ap_try;
 
     sz = 512;
-    buf = (char*)alloca(sz);
+    buf = (char*)malloc(sz);
  try_print:
-    cnt = vsnprintf(buf, sz, fmt, ap);
-    if (cnt >= sz) {
-        buf = (char*)alloca(cnt + 1);
-        sz = cnt + 1;
+	va_copy(ap_try, ap);
+	cnt = vsnprintf(buf, sz - 1, fmt, ap_try);
+	va_end(ap_try);
+	if (cnt > sz) {
+        sz *= 2;
+		buf = (char*)realloc(buf, sz);
         goto try_print;
     }
-    wcs = (wchar_t*)alloca((cnt+1) * sizeof(wchar_t));
+	if (cnt < 0) return cnt;
+	buf[cnt] = '\0';
+	wcs = (wchar_t*)malloc((cnt + 1) * sizeof(wchar_t));
     cnt = u8_toucs(wcs, cnt+1, buf, cnt);
-    wprintf(L"%ls", (wchar_t*)wcs);
-    return cnt;
+	wcs[cnt] = '\0';
+	wprintf(L"%ls", (wchar_t*)wcs);
+	free(buf);
+	free(wcs);
+	return cnt;
 }
 
 int u8_printf(const char *fmt, ...)

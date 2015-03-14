@@ -19,6 +19,7 @@ PCS_API char *pcs_utils_vsprintf(const char *fmt, va_list ap);
 PCS_API char *pcs_utils_sprintf(const char *fmt, ...);
 /*格式化size为容易读写模式*/
 PCS_API char *pcs_utils_readable_size(double size/*in bytes*/, char *buf, int buf_size, char *sp);
+PCS_API char* pcs_utils_readable_left_time(int64_t second, char *buf, int buf_size, char *sp);
 /*获取path的父目录*/
 PCS_API char *pcs_utils_basedir(const char *path);
 /*获取path中文件名部分*/
@@ -46,7 +47,12 @@ PCS_API const char *md5_file(const char *file_name);
 PCS_API void int2Buffer(int v, char *buf);
 
 /*int2Buffer的逆过程*/
-PCS_API int readInt(char *buf);
+PCS_API int readInt(const char *buf);
+
+/*
+* 提取出字符 callback({...}) 中的 {...} 部分
+*/
+PCS_API char *extract_json_from_callback(char *callback);
 
 
 #endif

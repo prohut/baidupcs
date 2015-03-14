@@ -2,15 +2,24 @@
 #define _PCS_DEFS_H
 
 #include <curl/curl.h>
+#include <stdint.h>
 
 #if defined(_MSC_VER) || defined(__BORLANDC__)
-typedef __int64 Int64;
-typedef unsigned __int64 UInt64;
-#define UINT64_CONST(n) n
+typedef __int64 int64_t;
+typedef unsigned __int64 uint64_t;
+#  ifndef PRId64
+#    define PRId64 "lld"
+#  endif
+#  ifndef PRIu64
+#    define PRIu64 "llu"
+#  endif
 #else
-typedef long long int Int64;
-typedef unsigned long long int UInt64;
-#define UINT64_CONST(n) n ## ULL
+#  ifndef PRId64
+#    define PRId64 "lld"
+#  endif
+#  ifndef PRIu64
+#    define PRIu64 "llu"
+#  endif
 #endif
 
 #ifdef WIN32

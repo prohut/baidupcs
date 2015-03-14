@@ -1,4 +1,5 @@
-﻿#include <stdio.h>
+﻿#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
@@ -13,8 +14,9 @@
 # include "pcs/openssl_aes.h"
 # include "pcs/openssl_md5.h"
 #else
-# include <inttypes.h>
+# include <unistd.h>
 # include <termios.h>
+# include <pthread.h>
 # include <openssl/aes.h>
 # include <openssl/md5.h>
 #endif
@@ -30,40 +32,76 @@
 #include "arg.h"
 #ifdef WIN32
 # include "utf8.h"
+# define lseek _lseek
+# define fileno _fileno
+# define fseeko _fseeki64
+# define ftello _ftelli64
 #endif
 #include "shell.h"
 
 #define USAGE "Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
 #define TIMEOUT						60
 #define CONNECTTIMEOUT				10
+#define MAX_THREAD_NUM				100
+#define MIN_SLICE_SIZE				(512 * 1024) /*最小分片大小*/
+#define MAX_SLICE_SIZE				(10 * 1024 * 1024) /*最大分片大小*/
+#define MAX_FFLUSH_SIZE				(10 * 1024 * 1024) /*最大缓存大小*/
+#define MIN_UPLOAD_SLICE_SIZE		(512 * 1024) /*最小分片大小*/
+#define MAX_UPLOAD_SLICE_SIZE		(10 * 1024 * 1024) /*最大分片大小*/
+#define MAX_UPLOAD_SLICE_COUNT		1024
+
+#define convert_to_real_speed(speed) ((speed) * 1024)
 
 #define PCS_CONTEXT_ENV				"PCS_CONTEXT"
 #define PCS_COOKIE_ENV				"PCS_COOKIE"
 #define PCS_CAPTCHA_ENV				"PCS_CAPTCHA"
 #define TEMP_FILE_SUFFIX			".pcs_temp"
+#define DECRYPT_FILE_SUFFIX			".decrypt"
+#define ENCRYPT_FILE_SUFFIX			".encrypt"
+#define SLICE_FILE_SUFFIX			".slice"
 //#define PCS_DEFAULT_CONTEXT_FILE	"/tmp/pcs_context.json"
 
+#define THREAD_STATE_MAGIC			(((int)'T' << 24) | ((int)'S' << 16) | ((int)'H' << 8) | ((int)'T'))
 
 #ifndef PCS_BUFFER_SIZE
 #  define PCS_BUFFER_SIZE			(AES_BLOCK_SIZE * 1024)
 #endif
 
-#define NONE         "\033[m"
-#define RED          "\033[0;32;31m"
-#define LIGHT_RED    "\033[1;31m"
-#define GREEN        "\033[0;32;32m"
-#define LIGHT_GREEN  "\033[1;32m"
-#define BLUE         "\033[0;32;34m"
-#define LIGHT_BLUE   "\033[1;34m"
-#define DARY_GRAY    "\033[1;30m"
-#define CYAN         "\033[0;36m"
-#define LIGHT_CYAN   "\033[1;36m"
-#define PURPLE       "\033[0;35m"
-#define LIGHT_PURPLE "\033[1;35m"
-#define BROWN        "\033[0;33m"
-#define YELLOW       "\033[1;33m"
-#define LIGHT_GRAY   "\033[0;37m"
-#define WHITE        "\033[1;37m"
+#ifdef _WIN32
+#  define NONE
+#  define RED
+#  define LIGHT_RED
+#  define GREEN
+#  define LIGHT_GREEN
+#  define BLUE
+#  define LIGHT_BLUE
+#  define DARY_GRAY
+#  define CYAN
+#  define LIGHT_CYAN
+#  define PURPLE
+#  define LIGHT_PURPLE
+#  define BROWN
+#  define YELLOW
+#  define LIGHT_GRAY
+#  define WHITE
+#else
+#  define NONE         "\033[m"
+#  define RED          "\033[0;32;31m"
+#  define LIGHT_RED    "\033[1;31m"
+#  define GREEN        "\033[0;32;32m"
+#  define LIGHT_GREEN  "\033[1;32m"
+#  define BLUE         "\033[0;32;34m"
+#  define LIGHT_BLUE   "\033[1;34m"
+#  define DARY_GRAY    "\033[1;30m"
+#  define CYAN         "\033[0;36m"
+#  define LIGHT_CYAN   "\033[1;36m"
+#  define PURPLE       "\033[0;35m"
+#  define LIGHT_PURPLE "\033[1;35m"
+#  define BROWN        "\033[0;33m"
+#  define YELLOW       "\033[1;33m"
+#  define LIGHT_GRAY   "\033[0;37m"
+#  define WHITE        "\033[1;37m"
+#endif
 
 #define PRINT_PAGE_SIZE			20		/*列出目录或列出比较结果时，分页大小*/
 
@@ -85,6 +123,26 @@
 #define FLAG_ON_REMOTE			2
 #define FLAG_PARENT_NOT_ON_REMOTE 4
 
+#define PCS_SECURE_NONE				((int)0)
+#define PCS_SECURE_PLAINTEXT		((int)1)
+#define PCS_SECURE_AES_CBC_128		((int)128)
+#define PCS_SECURE_AES_CBC_192		((int)192)
+#define PCS_SECURE_AES_CBC_256		((int)256)
+
+#define PCS_AES_MAGIC				(0x41455300)
+
+#define DOWNLOAD_STATUS_OK				0
+#define DOWNLOAD_STATUS_PENDDING		1
+#define DOWNLOAD_STATUS_WRITE_FILE_FAIL	2
+#define DOWNLOAD_STATUS_FAIL			3
+#define DOWNLOAD_STATUS_DOWNLOADING		4
+
+#define UPLOAD_STATUS_OK				0
+#define UPLOAD_STATUS_PENDDING			1
+#define UPLOAD_STATUS_WRITE_FILE_FAIL	2
+#define UPLOAD_STATUS_FAIL				3
+#define UPLOAD_STATUS_UPLOADING			4
+
 /* 文件元数据*/
 typedef struct MyMeta MyMeta;
 struct MyMeta
@@ -98,6 +156,7 @@ struct MyMeta
 	char		*remote_path;	/*文件路径*/
 	time_t		remote_mtime;	/*文件在网盘中的最后修改时间*/
 	int			remote_isdir;	/*文件在网盘中是以文件存在还是以目录存在。0表示以文件存在；非0值表示以目录存在*/
+	char		*md5;
 
 	int			flag;
 
@@ -109,11 +168,36 @@ struct MyMeta
 	void		*userdata;		/*用户数据*/
 };
 
+struct DownloadThreadState;
+
 struct DownloadState
 {
 	FILE *pf;
-	char *msg;
-	size_t size;
+	int64_t downloaded_size; /*已经下载的字节数*/
+	curl_off_t resume_from; /*断点续传时，从这个位置开始续传*/
+	size_t noflush_size; /*未执行fflush()的字节大小*/
+	time_t time; /*最后一次在屏幕打印信息的时间*/
+	size_t speed; /*用于统计下载速度*/
+	int64_t file_size; /*完整的文件的字节大小*/
+	ShellContext *context;
+	void *mutex;
+	int	num_of_running_thread; /*已经启动的线程数量*/
+	int num_of_slice; /*分片数量*/
+	char **pErrMsg;
+	int	status;
+	const char *remote_file;
+	struct DownloadThreadState *threads;
+};
+
+struct DownloadThreadState
+{
+	struct DownloadState *ds;
+	curl_off_t	start;
+	curl_off_t	end;
+	int		status;
+	Pcs		*pcs;
+	int		tid;
+	struct DownloadThreadState *next;
 };
 
 struct RBEnumerateState
@@ -172,6 +256,36 @@ struct ScanLocalFileState
 {
 	rb_red_blk_tree *rb;
 	int				total;
+};
+
+struct UploadThreadState;
+struct UploadState {
+	FILE *pf;
+	char *path;
+	char *slice_file;
+	int64_t uploaded_size; /*已经下载的字节数*/
+	time_t time; /*最后一次在屏幕打印信息的时间*/
+	size_t speed; /*用于统计下载速度*/
+	int64_t file_size; /*完整的文件的字节大小*/
+	ShellContext *context;
+	void *mutex;
+	int	num_of_running_thread; /*已经启动的线程数量*/
+	int num_of_slice; /*分片数量*/
+	char **pErrMsg;
+	int	status;
+	struct UploadThreadState *threads;
+};
+
+struct UploadThreadState {
+	struct UploadState *us;
+	curl_off_t	start;
+	curl_off_t	end;
+	int		status;
+	size_t  uploaded_size;
+	Pcs		*pcs;
+	char	md5[33]; /*上传成功后的分片MD5值*/
+	int		tid;
+	struct UploadThreadState *next;
 };
 
 static char *app_name = NULL;
@@ -276,7 +390,517 @@ int u8_tombs_size(const char *src, int srcsz)
 
 # define sleep(s) Sleep((s) * 1000)
 
+int truncate(const char *file, int64_t size)
+{
+	HANDLE hFile;
+	hFile = CreateFile(file, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile) {
+		LARGE_INTEGER li = {0};
+		li.QuadPart = (LONGLONG)size;
+		SetFilePointer(hFile, li.LowPart, &li.HighPart, FILE_BEGIN);
+		SetEndOfFile(hFile);
+		CloseHandle(hFile);
+		return 0;
+	}
+	return -1;
+}
+
 #endif
+
+#pragma region 加解密文件
+
+static inline int get_secure_method(ShellContext *context)
+{
+	if (!context->secure_method) return -1;
+	if (!strcmp(context->secure_method, "aes-cbc-128")) return PCS_SECURE_AES_CBC_128;
+	if (!strcmp(context->secure_method, "aes-cbc-192")) return PCS_SECURE_AES_CBC_192;
+	if (!strcmp(context->secure_method, "aes-cbc-256")) return PCS_SECURE_AES_CBC_256;
+	return -1;
+}
+
+static inline void readToAesHead(const char *buf, struct PcsAesHead *head)
+{
+	head->magic = readInt(buf);
+	head->bits = readInt(&buf[4]);
+	head->polish = readInt(&buf[8]);
+	head->reserve = readInt(&buf[12]);
+}
+
+static int get_file_secure_method(const char *src)
+{
+	FILE *srcFile;
+	int64_t file_sz;
+	size_t sz;
+	unsigned char buf[PCS_BUFFER_SIZE];
+	struct PcsAesHead head = { 0 };
+
+	srcFile = fopen(src, "rb");
+	if (!srcFile) {
+		//fprintf(stderr, "Error: Can't open the source file: %s\n", src);
+		return -1;
+	}
+	fseeko(srcFile, 0, SEEK_END);
+	file_sz = ftello(srcFile);
+	fseeko(srcFile, 0, SEEK_SET);
+
+	if (file_sz < 32) {
+		fclose(srcFile);
+		return PCS_SECURE_PLAINTEXT;
+	}
+
+	sz = fread(buf, 1, 16, srcFile);
+	if (sz != 16) {
+		//fprintf(stderr, "Error: Can't read the source file: %s\n", src);
+		fclose(srcFile);
+		return -1;
+	}
+
+	readToAesHead(buf, &head);
+	if (head.magic != PCS_AES_MAGIC || (head.bits != PCS_SECURE_AES_CBC_128 && head.bits != PCS_SECURE_AES_CBC_192 && head.bits != PCS_SECURE_AES_CBC_256)) {
+		fclose(srcFile);
+		return PCS_SECURE_PLAINTEXT;
+	}
+	fclose(srcFile);
+
+	if (((file_sz - 32) % AES_BLOCK_SIZE) != 0) {
+		//fprintf(stderr, "Error: The file is not a encrypt file or is broken.\n");
+		return -1;
+	}
+	return head.bits;
+}
+
+static int encrypt_file(const char *src, const char *dst, int secure_method, const char *secure_key, char **pErrMsg)
+{
+	MD5_CTX md5;
+	unsigned char md5_value[16], buf[PCS_BUFFER_SIZE], out_buf[PCS_BUFFER_SIZE];
+	FILE *srcFile, *dstFile;
+	char *tmp_local_path;
+	int64_t file_sz;
+	size_t buf_sz, sz;
+	int polish;
+	AES_KEY				aes = { 0 };
+	unsigned char		key[AES_BLOCK_SIZE] = { 0 };
+	unsigned char		iv[AES_BLOCK_SIZE] = { 0 };
+	int rc;
+	rc = AES_set_encrypt_key(md5_string_raw(secure_key), secure_method, &aes);
+	if (rc < 0) {
+		fprintf(stderr, "Error: Can't set encrypt key.\n");
+		return -1;
+	}
+	MD5_Init(&md5);
+	srcFile = fopen(src, "rb");
+	if (!srcFile) {
+		fprintf(stderr, "Error: Can't open the source file: %s\n", src);
+		return -1;
+	}
+	tmp_local_path = (char *)pcs_malloc(strlen(src) + strlen(ENCRYPT_FILE_SUFFIX) + 1);
+	strcpy(tmp_local_path, src);
+	strcat(tmp_local_path, ENCRYPT_FILE_SUFFIX);
+	dstFile = fopen(tmp_local_path, "wb");
+	if (!dstFile) {
+		fprintf(stderr, "Error: Can't create the temp file: %s\n", tmp_local_path);
+		fclose(srcFile);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+
+	fseeko(srcFile, 0, SEEK_END);
+	file_sz = ftello(srcFile);
+	fseeko(srcFile, 0, SEEK_SET);
+
+	polish = 0;
+	if (file_sz % AES_BLOCK_SIZE == 0) {
+		polish = 0;
+	}
+	else {
+		polish = (int)((file_sz / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE - file_sz);
+	}
+	int2Buffer(PCS_AES_MAGIC, buf);
+	int2Buffer(secure_method, &buf[4]);
+	int2Buffer(polish, &buf[8]);
+	int2Buffer(0, &buf[12]);
+	sz = fwrite(buf, 1, 16, dstFile);
+	if (sz != 16) {
+		fprintf(stderr, "Error: Write data to %s error. \n", dst);
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+
+	while ((sz = fread(buf, 1, PCS_BUFFER_SIZE, srcFile)) > 0) {
+		MD5_Update(&md5, buf, sz);
+		if ((sz % AES_BLOCK_SIZE) != 0) {
+			buf_sz = (size_t)((sz / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE);
+			memset(&buf[sz], 0, buf_sz - sz);
+		}
+		else {
+			buf_sz = sz;
+		}
+		// encrypt (iv will change)
+		AES_cbc_encrypt(buf, out_buf, buf_sz, &aes, iv, AES_ENCRYPT);
+		sz = fwrite(out_buf, 1, buf_sz, dstFile);
+		if (sz != buf_sz) {
+			fprintf(stderr, "Error: Write data to %s error. \n", dst);
+			fclose(srcFile);
+			fclose(dstFile);
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			return -1;
+		}
+	}
+	MD5_Final(md5_value, &md5);
+	sz = fwrite(md5_value, 1, 16, dstFile);
+	if (sz != 16) {
+		fprintf(stderr, "Error: Write data to %s error. \n", dst);
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+	fclose(srcFile);
+	fclose(dstFile);
+	DeleteFileRecursive(dst);
+	if (rename(tmp_local_path, dst)) {
+		fprintf(stderr, "Error: The file have been encrypted at %s, but can't rename to %s.\n You should be rename manual.\n", tmp_local_path, dst);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+	pcs_free(tmp_local_path);
+	//printf("Success\n");
+	return 0;
+}
+
+static int decrypt_file(const char *src, const char *dst, const char *secure_key, char **pErrMsg)
+{
+	struct PcsAesHead head = { 0 };
+	MD5_CTX md5;
+	unsigned char md5_value[16], buf[PCS_BUFFER_SIZE], out_buf[PCS_BUFFER_SIZE];
+	char *tmp_local_path;
+	FILE *srcFile, *dstFile;
+	int64_t file_sz;
+	size_t sz, buf_sz;
+	AES_KEY				aes = { 0 };
+	unsigned char		key[AES_BLOCK_SIZE] = { 0 };
+	unsigned char		iv[AES_BLOCK_SIZE] = { 0 };
+	int rc, i;
+	MD5_Init(&md5);
+	srcFile = fopen(src, "rb");
+	if (!srcFile) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: Can't open the source file: %s\n", src);
+		}
+		return -1;
+	}
+	tmp_local_path = (char *)pcs_malloc(strlen(src) + strlen(DECRYPT_FILE_SUFFIX) + 1);
+	strcpy(tmp_local_path, src);
+	strcat(tmp_local_path, DECRYPT_FILE_SUFFIX);
+	dstFile = fopen(tmp_local_path, "wb");
+	if (!dstFile) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: Can't create the temp file: %s\n", tmp_local_path);
+		}
+		fclose(srcFile);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+
+	fseeko(srcFile, 0, SEEK_END);
+	file_sz = ftello(srcFile);
+	fseeko(srcFile, 0, SEEK_SET);
+
+	if (file_sz < 32 || ((file_sz - 32) % AES_BLOCK_SIZE) != 0) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: The file is not a encrypt file or is broken.\n");
+		}
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+
+	sz = fread(buf, 1, 16, srcFile);
+	if (sz != 16) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: Can't read the source file: %s\n", src);
+		}
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+
+	readToAesHead(buf, &head);
+	if (head.magic != PCS_AES_MAGIC || (head.bits != 128 && head.bits != 192 && head.bits != 256)) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: The file is not a encrypt file or is broken.\n");
+		}
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+
+	rc = AES_set_decrypt_key(md5_string_raw(secure_key), head.bits, &aes);
+	if (rc < 0) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: Can't set decrypt key.\n");
+		}
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+	file_sz -= 32;
+	if (file_sz < PCS_BUFFER_SIZE) {
+		buf_sz = (size_t)file_sz;
+	}
+	else {
+		buf_sz = PCS_BUFFER_SIZE;
+	}
+	while ((sz = fread(buf, 1, buf_sz, srcFile)) > 0) {
+		if (sz != buf_sz) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Error: Can't read the source file: %s\n", src);
+			}
+			fclose(srcFile);
+			fclose(dstFile);
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			return -1;
+		}
+		AES_cbc_encrypt(buf, out_buf, buf_sz, &aes, iv, AES_DECRYPT);
+		if (file_sz == (int64_t)buf_sz) {
+			buf_sz -= head.polish;
+			file_sz = (int64_t)buf_sz;
+		}
+		MD5_Update(&md5, out_buf, buf_sz);
+		sz = fwrite(out_buf, 1, buf_sz, dstFile);
+		if (sz != buf_sz) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Error: Write data to %s error. \n", dst);
+			}
+			fclose(srcFile);
+			fclose(dstFile);
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			return -1;
+		}
+		file_sz -= (int64_t)buf_sz;
+		if (file_sz == 0) break;
+		if (file_sz < PCS_BUFFER_SIZE) {
+			buf_sz = (size_t)file_sz;
+		}
+		else {
+			buf_sz = PCS_BUFFER_SIZE;
+		}
+	}
+	MD5_Final(md5_value, &md5);
+	sz = fread(buf, 1, 16, srcFile);
+	if (sz != 16) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf("Error: Can't read the source file: %s\n", src);
+		}
+		fclose(srcFile);
+		fclose(dstFile);
+		DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+	for (i = 0; i < 16; i++) {
+		if (md5_value[i] != buf[i]) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Error: Wrong key or broken file\n");
+			}
+			fclose(srcFile);
+			fclose(dstFile);
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			return -1;
+		}
+	}
+	fclose(srcFile);
+	fclose(dstFile);
+	DeleteFileRecursive(dst);
+	if (rename(tmp_local_path, dst)) {
+		if (pErrMsg) {
+			if (*pErrMsg) pcs_free(*pErrMsg);
+			(*pErrMsg) = pcs_utils_sprintf(
+				"Error: The file have been decrypted at %s, but can't rename to %s.\n You should be rename manual.\n", tmp_local_path, dst);
+		}
+		//DeleteFileRecursive(tmp_local_path);
+		pcs_free(tmp_local_path);
+		return -1;
+	}
+	pcs_free(tmp_local_path);
+	//printf("Success\n");
+	return 0;
+}
+
+static int get_data_secure_method(const char *buffer, size_t buffer_size)
+{
+	struct PcsAesHead head = { 0 };
+	if (!buffer) {
+		return -1;
+	}
+	if (buffer_size < 32) {
+		return PCS_SECURE_PLAINTEXT;
+	}
+
+	readToAesHead((char *)buffer, &head);
+	if (head.magic != PCS_AES_MAGIC || (head.bits != PCS_SECURE_AES_CBC_128 && head.bits != PCS_SECURE_AES_CBC_192 && head.bits != PCS_SECURE_AES_CBC_256)) {
+		return PCS_SECURE_PLAINTEXT;
+	}
+
+	if (((buffer_size - 32) % AES_BLOCK_SIZE) != 0) {
+		//fprintf(stderr, "Error: The file is not a encrypt file or is broken.\n");
+		return -1;
+	}
+	return head.bits;
+}
+
+static int encrypt_data(const char *src, size_t src_size, char **dst, size_t *dst_size,
+	int secure_method, const char *secure_key)
+{
+	int rc;
+	MD5_CTX md5;
+	AES_KEY				aes = { 0 };
+	unsigned char		key[AES_BLOCK_SIZE] = { 0 };
+	unsigned char		iv[AES_BLOCK_SIZE] = { 0 };
+	int blockCount;
+	size_t outsz;
+	char *out_buf, *md5_value;
+	int i;
+	const char *pin;
+	char *pout, buf[32];
+
+	rc = AES_set_encrypt_key(md5_string_raw(secure_key), secure_method, &aes);
+	if (rc < 0) {
+		fprintf(stderr, "Error: Can't set encrypt key.\n");
+		return -1;
+	}
+
+	blockCount = src_size / AES_BLOCK_SIZE;
+	if ((src_size % AES_BLOCK_SIZE) != 0) {
+		blockCount++;
+	}
+	outsz = blockCount * AES_BLOCK_SIZE + 32;
+	out_buf = (unsigned char *)pcs_malloc(outsz);
+	if (!out_buf) {
+		fprintf(stderr, "Error: can't alloc memory.\n");
+		return -1;
+	}
+	pout = out_buf;
+	int2Buffer(PCS_AES_MAGIC, pout);
+	int2Buffer(secure_method, pout + 4);
+	int2Buffer((int)(outsz - src_size - 32), pout + 8);
+	int2Buffer(0, pout + 12);
+	pout += 16;
+	pin = src;
+
+	MD5_Init(&md5);
+	for (i = 0; i < blockCount; i++) {
+		if ((size_t)((i + 1) * AES_BLOCK_SIZE) > src_size) {
+			MD5_Update(&md5, pin, src_size - i * AES_BLOCK_SIZE);
+			memcpy(buf, pin, src_size - i * AES_BLOCK_SIZE);
+			memset(buf + src_size - i * AES_BLOCK_SIZE, 0, AES_BLOCK_SIZE - (src_size - i * AES_BLOCK_SIZE));
+			// encrypt (iv will change)
+			AES_cbc_encrypt(buf, pout, AES_BLOCK_SIZE, &aes, iv, AES_ENCRYPT);
+			pout += AES_BLOCK_SIZE;
+		}
+		else {
+			MD5_Update(&md5, pin, AES_BLOCK_SIZE);
+			// encrypt (iv will change)
+			AES_cbc_encrypt(pin, pout, AES_BLOCK_SIZE, &aes, iv, AES_ENCRYPT);
+			pin += AES_BLOCK_SIZE;
+			pout += AES_BLOCK_SIZE;
+		}
+	}
+	md5_value = pout;
+	MD5_Final(md5_value, &md5);
+	*dst = out_buf;
+	*dst_size = outsz;
+	return 0;
+}
+
+static int decrypt_data(const char *src, size_t src_size, char **dst, size_t *dst_size,
+	const char *secure_key)
+{
+	int rc;
+	struct PcsAesHead head = { 0 };
+	MD5_CTX md5;
+	AES_KEY				aes = { 0 };
+	unsigned char		key[AES_BLOCK_SIZE] = { 0 };
+	unsigned char		iv[AES_BLOCK_SIZE] = { 0 };
+	char md5_value[16], *pout, *outbuf;
+	const char *pin;
+	int blockCount;
+	int i;
+	size_t outsz;
+
+	MD5_Init(&md5);
+
+	if (src_size < 32 || ((src_size - 32) % AES_BLOCK_SIZE) != 0) {
+		return -1;
+	}
+
+	readToAesHead(src, &head);
+	if (head.magic != PCS_AES_MAGIC || (head.bits != 128 && head.bits != 192 && head.bits != 256)) {
+		return -1;
+	}
+
+	rc = AES_set_decrypt_key(md5_string_raw(secure_key), head.bits, &aes);
+	if (rc < 0) {
+		return -1;
+	}
+
+	outsz = src_size - 32 - head.polish;
+	outbuf = (char *)pcs_malloc(src_size);
+
+	pin = src + 16;
+	pout = outbuf;
+
+	blockCount = (src_size - 32) / AES_BLOCK_SIZE;
+
+	for (i = 0; i < blockCount;i++) {
+		AES_cbc_encrypt(pin, pout, AES_BLOCK_SIZE, &aes, iv, AES_DECRYPT);
+		if ((size_t)(i + 1) * AES_BLOCK_SIZE > outsz)
+			MD5_Update(&md5, pout, AES_BLOCK_SIZE - head.polish);
+		else
+			MD5_Update(&md5, pout, AES_BLOCK_SIZE);
+		pin += AES_BLOCK_SIZE;
+		pout += AES_BLOCK_SIZE;
+	}
+	MD5_Final(md5_value, &md5);
+	for (i = 0; i < 16; i++) {
+		if (md5_value[i] != pin[i]) {
+			pcs_free(outbuf);
+			return -1;
+		}
+	}
+	*dst = outbuf;
+	*dst_size = outsz;
+	return 0;
+}
+
+#pragma endregion
 
 #pragma region 获取默认路径
 
@@ -352,12 +976,155 @@ static const char *captchafile()
 
 #pragma endregion
 
+#pragma region 线程 State 相关
+
+static void init_download_state(struct DownloadState *ds)
+{
+	memset(ds, 0, sizeof(struct DownloadState));
+#ifdef _WIN32
+	ds->mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+	ds->mutex = (pthread_mutex_t *)pcs_malloc(sizeof(pthread_mutex_t));
+	pthread_mutex_init((pthread_mutex_t *)ds->mutex, NULL);
+#endif
+}
+
+static void uninit_download_state(struct DownloadState *ds)
+{
+	struct DownloadThreadState *ts = ds->threads, *ps = NULL;
+#ifdef _WIN32
+	CloseHandle(ds->mutex);
+#else
+	pthread_mutex_destroy((pthread_mutex_t *)ds->mutex);
+	pcs_free(ds->mutex);
+#endif
+	while (ts) {
+		ps = ts;
+		ts = ts->next;
+		pcs_free(ps);
+	}
+}
+
+static void lock_for_download(struct DownloadState *ds)
+{
+#ifdef _WIN32
+	WaitForSingleObject(ds->mutex, INFINITE);
+#else
+	pthread_mutex_lock((pthread_mutex_t *)ds->mutex);
+#endif
+}
+
+static void unlock_for_download(struct DownloadState *ds)
+{
+#ifdef _WIN32
+	ReleaseMutex(ds->mutex);
+#else
+	pthread_mutex_unlock((pthread_mutex_t *)ds->mutex);
+#endif
+}
+
+static void init_upload_state(struct UploadState *us)
+{
+	memset(us, 0, sizeof(struct UploadState));
+#ifdef _WIN32
+	us->mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+	us->mutex = (pthread_mutex_t *)pcs_malloc(sizeof(pthread_mutex_t));
+	pthread_mutex_init((pthread_mutex_t *)us->mutex, NULL);
+#endif
+}
+
+static void uninit_upload_state(struct UploadState *us)
+{
+	struct UploadThreadState *ts = us->threads, *ps = NULL;
+#ifdef _WIN32
+	CloseHandle(us->mutex);
+#else
+	pthread_mutex_destroy((pthread_mutex_t *)us->mutex);
+	pcs_free(us->mutex);
+#endif
+	while (ts) {
+		ps = ts;
+		ts = ts->next;
+		pcs_free(ps);
+	}
+}
+
+static void lock_for_upload(struct UploadState *us)
+{
+#ifdef _WIN32
+	WaitForSingleObject(us->mutex, INFINITE);
+#else
+	pthread_mutex_lock((pthread_mutex_t *)us->mutex);
+#endif
+}
+
+static void unlock_for_upload(struct UploadState *us)
+{
+#ifdef _WIN32
+	ReleaseMutex(us->mutex);
+#else
+	pthread_mutex_unlock((pthread_mutex_t *)us->mutex);
+#endif
+}
+
+#pragma endregion
+
 #pragma region 三个回调： 输入验证码、显示上传进度、写下载文件
+
+static int save_thread_states_to_file(FILE *pf, int64_t offset, struct DownloadThreadState *state_link)
+{
+	static int magic = THREAD_STATE_MAGIC;
+	int rc;
+	struct DownloadThreadState *pts;
+	//lseek(fileno(pf), ds->file_size, SEEK_SET);
+	rc = fseeko((pf), offset, SEEK_SET);
+	if (rc) {
+		return -1;
+	}
+	rc = fwrite(&magic, 4, 1, pf);
+	if (rc != 1) return -1;
+	pts = state_link;
+	while (pts) {
+		rc = fwrite(pts, sizeof(struct DownloadThreadState), 1, pf);
+		if (rc != 1) return -1;
+		pts = pts->next;
+	}
+	return 0;
+}
+
+static int save_upload_thread_states_to_file(const char *filename, struct UploadThreadState *state_link)
+{
+	static int magic = THREAD_STATE_MAGIC;
+	FILE *pf;
+	int rc;
+	struct UploadThreadState *pts;
+	pf = fopen(filename, "wb");
+	if (!pf) return -1;
+	rc = fwrite(&magic, 4, 1, pf);
+	if (rc != 1) {
+		fclose(pf);
+		return -1;
+	}
+	pts = state_link;
+	while (pts) {
+		rc = fwrite(pts, sizeof(struct UploadThreadState), 1, pf);
+		if (rc != 1) {
+			fclose(pf);
+			return -1;
+		}
+		pts = pts->next;
+	}
+	fclose(pf);
+	return 0;
+}
 
 /*输出验证码图片，并等待用户输入识别结果*/
 static PcsBool verifycode(unsigned char *ptr, size_t size, char *captcha, size_t captchaSize, void *state)
 {
 	static char filename[1024] = { 0 };
+	ShellContext *context = (ShellContext *)state;
+	const char *savedfile;
 	FILE *pf;
 
 	if (!filename[0]) {
@@ -374,12 +1141,20 @@ static PcsBool verifycode(unsigned char *ptr, size_t size, char *captcha, size_t
 #endif
 	}
 
-	pf = fopen(filename, "wb");
-	if (!pf) return PcsFalse;
+	if (context->captchafile)
+		savedfile = context->captchafile;
+	else
+		savedfile = filename;
+
+	pf = fopen(savedfile, "wb");
+	if (!pf) {
+		printf("Can't save the captcha image to %s.\n", savedfile);
+		return PcsFalse;
+	}
 	fwrite(ptr, 1, size, pf);
 	fclose(pf);
 
-	printf("The captcha image at %s.\nPlease input the captcha code: ", filename);
+	printf("The captcha image at %s.\nPlease input the captcha code: ", savedfile);
 	std_string(captcha, captchaSize);
 	return PcsTrue;
 }
@@ -406,16 +1181,155 @@ static int download_write(char *ptr, size_t size, size_t contentlength, void *us
 	struct DownloadState *ds = (struct DownloadState *)userdata;
 	FILE *pf = ds->pf;
 	size_t i;
+	time_t tm;
 	char tmp[64];
 	tmp[63] = '\0';
 	i = fwrite(ptr, 1, size, pf);
-	ds->size += i;
-	if (ds->msg)
-		printf("%s", ds->msg);
-	printf("%s", pcs_utils_readable_size(ds->size, tmp, 63, NULL));
-	printf("/%s      \r", pcs_utils_readable_size(contentlength, tmp, 63, NULL));
-	fflush(stdout);
+	if (i != size) {
+		unlock_for_download(ds);
+		return 0;
+	}
+	ds->downloaded_size += i;
+	ds->speed += i;
+	ds->noflush_size += i;
+	if (ds->noflush_size > MAX_FFLUSH_SIZE) {
+		fflush(pf);
+		ds->noflush_size = 0;
+	}
+	tm = time(&tm);
+	if (tm != ds->time) {
+		int64_t left_size = ds->file_size - ds->downloaded_size;
+		int64_t remain_tm = (ds->speed > 0) ? (left_size / ds->speed) : 0;
+		ds->time = tm;
+		printf("%s", pcs_utils_readable_size((double)ds->downloaded_size + (double)ds->resume_from, tmp, 63, NULL));
+		printf("/%s \t", pcs_utils_readable_size((double)contentlength + (double)ds->resume_from, tmp, 63, NULL));
+		printf("%s/s \t", pcs_utils_readable_size((double)ds->speed, tmp, 63, NULL));
+		printf("%s            ", pcs_utils_readable_left_time(remain_tm, tmp, 63, NULL));
+		printf("\r");
+		fflush(stdout);
+		ds->speed = 0;
+	}
 	return i;
+}
+
+static int download_write_for_multy_thread(char *ptr, size_t size, size_t contentlength, void *userdata)
+{
+	struct DownloadThreadState *ts = (struct DownloadThreadState *)userdata;
+	ShellContext *context = ts->ds->context;
+	struct DownloadState *ds = ts->ds;
+	FILE *pf = ds->pf;
+	time_t tm;
+	char tmp[64];
+	int rc;
+	tmp[63] = '\0';
+	lock_for_download(ds);
+	//lseek(fileno(pf), ts->start, SEEK_SET);
+	rc = fseeko((pf), ts->start, SEEK_SET);
+	if (rc) {
+		if (ds->pErrMsg) {
+			if (*(ds->pErrMsg)) pcs_free(*(ds->pErrMsg));
+			(*(ds->pErrMsg)) = pcs_utils_sprintf("fseeko() error.");
+		}
+		ds->status = DOWNLOAD_STATUS_WRITE_FILE_FAIL;
+		unlock_for_download(ds);
+		return 0;
+	}
+	if (ts->start + size > ts->end) {
+		size = (size_t)(ts->end - ts->start);
+		ts->status = DOWNLOAD_STATUS_OK;
+	}
+	if (size > 0) {
+		rc = fwrite(ptr, 1, size, pf);
+		if (rc != size) {
+			if (ds->pErrMsg) {
+				if (*(ds->pErrMsg)) pcs_free(*(ds->pErrMsg));
+				(*(ds->pErrMsg)) = pcs_utils_sprintf("fwrite() error.");
+			}
+			ds->status = DOWNLOAD_STATUS_WRITE_FILE_FAIL;
+			unlock_for_download(ds);
+			return 0;
+		}
+	}
+	ds->downloaded_size += size;
+	ts->start += size;
+	ds->speed += size;
+	ds->noflush_size += size;
+	if (ts->start == ts->end) {
+		ts->status = DOWNLOAD_STATUS_OK;
+		size = 0;
+	}
+
+	if (save_thread_states_to_file(pf, ds->file_size, ds->threads)) {
+		if (ds->pErrMsg) {
+			if (*(ds->pErrMsg)) pcs_free(*(ds->pErrMsg));
+			(*(ds->pErrMsg)) = pcs_utils_sprintf("save slices error.");
+		}
+		ds->status = DOWNLOAD_STATUS_WRITE_FILE_FAIL;
+		unlock_for_download(ds);
+		return 0;
+	}
+
+	//if (ds->noflush_size > MAX_FFLUSH_SIZE) {
+	//	fflush(pf);
+	//	ds->noflush_size = 0;
+	//}
+	tm = time(&tm);
+	if (tm != ds->time) {
+		int64_t left_size = ds->file_size - ds->downloaded_size;
+		int64_t remain_tm = (ds->speed > 0) ? (left_size / ds->speed) : 0;
+		ds->time = tm;
+		printf("\r                                                \r");
+		printf("%s", pcs_utils_readable_size((double)ds->downloaded_size + (double)ds->resume_from, tmp, 63, NULL));
+		printf("/%s \t", pcs_utils_readable_size((double)ds->file_size, tmp, 63, NULL));
+		printf("%s/s \t", pcs_utils_readable_size((double)ds->speed, tmp, 63, NULL));
+		printf(" %s        ", pcs_utils_readable_left_time(remain_tm, tmp, 63, NULL));
+		printf("\r");
+		fflush(stdout);
+		ds->speed = 0;
+	}
+
+	unlock_for_download(ds);
+	return size;
+}
+
+/*显示上传进度*/
+static int upload_progress_for_multy_thread(void *clientp, double dltotal, double dlnow, double ultotal, double ulnow)
+{
+	static char tmp[64];
+	struct UploadThreadState *ts = (struct UploadThreadState*)clientp;
+	struct UploadState *us = ts->us;
+	time_t tm;
+
+	lock_for_upload(us);
+
+	tmp[63] = '\0';
+	if ((((size_t)ulnow) > 0) && (((size_t)ulnow) > ts->uploaded_size)) {
+		us->speed += ((size_t)ulnow - ts->uploaded_size);
+		us->uploaded_size += ((size_t)ulnow - ts->uploaded_size);
+		ts->uploaded_size = (size_t)ulnow;
+	}
+	else {
+		unlock_for_upload(us);
+		return 0;
+	}
+
+	tm = time(&tm);
+	if (tm != us->time) {
+		int64_t left_size = us->file_size - us->uploaded_size;
+		int64_t remain_tm = (us->speed > 0) ? (left_size / us->speed) : 0;
+		us->time = tm;
+		printf("\r                                                \r");
+		printf("%s", pcs_utils_readable_size((double)us->uploaded_size, tmp, 63, NULL));
+		printf("/%s \t", pcs_utils_readable_size((double)us->file_size, tmp, 63, NULL));
+		printf("%s/s \t", pcs_utils_readable_size((double)us->speed, tmp, 63, NULL));
+		printf(" %s        ", pcs_utils_readable_left_time(remain_tm, tmp, 63, NULL));
+		printf("\r");
+		fflush(stdout);
+		us->speed = 0;
+	}
+
+	unlock_for_upload(us);
+	return 0;
 }
 
 #pragma endregion
@@ -433,15 +1347,25 @@ static inline char *findchar(char *str, int ch)
 /*回到上一行*/
 static inline void clear_current_print_line()
 {
+#ifdef _WIN32
+	printf("\r");  //清除该行
+#else
 	//printf("\033[1A"); //先回到上一行
 	printf("\033[K");  //清除该行
+#endif
 }
 
 /*回到上一行*/
 static inline void back_prev_print_line()
 {
+#ifdef _WIN32
+	printf("\r"); //先回到上一行
+	printf("                                        ");  //清除该行
+	printf("\r"); //先回到上一行
+#else
 	printf("\033[1A"); //先回到上一行
 	printf("\033[K");  //清除该行
+#endif
 }
 
 /*把文件大小转换成字符串*/
@@ -451,6 +1375,54 @@ static const char *size_tostr(size_t size, int *fix_width, char ch)
 	int i;
 	int j, cn, mod;
 	size_t sz;
+
+	if (size == 0) {
+		i = 0;
+		if (*fix_width > 0) {
+			for (; i < *fix_width - 1; i++) {
+				str[i] = ch;
+			}
+		}
+		str[i] = '0';
+		str[i + 1] = '\0';
+		if (*fix_width < 0)
+			*fix_width = 1;
+		return str;
+	}
+
+	sz = size;
+	j = 127;
+	str[j] = '\0';
+	cn = 0;
+	while (sz != 0) {
+		mod = sz % 10;
+		sz = sz / 10;
+		str[--j] = (char)('0' + mod);
+		cn++;
+	}
+
+	i = 0;
+	if (*fix_width > 0) {
+		for (; i < *fix_width - cn; i++) {
+			str[i] = ch;
+		}
+	}
+	p = &str[j];
+	while (*p){
+		str[i++] = *p++;
+	}
+	str[i] = '\0';
+	if (*fix_width < 0)
+		*fix_width = (int)i;
+	return str;
+}
+
+static const char *uint64_tostr(int64_t size, int *fix_width, char ch)
+{
+	static char str[128], *p;
+	int i;
+	int j, cn, mod;
+	int64_t sz;
 
 	if (size == 0) {
 		i = 0;
@@ -527,6 +1499,14 @@ static void print_size(const char *format, size_t size)
 	printf(format, tmp);
 }
 
+static void print_uint64(const char *format, int64_t size)
+{
+	char tmp[64];
+	tmp[63] = '\0';
+	pcs_utils_readable_size((double)size, tmp, 63, NULL);
+	printf(format, tmp);
+}
+
 /*打印文件列表的头*/
 static void print_filelist_head(int size_width)
 {
@@ -556,7 +1536,7 @@ static void print_filelist_row(PcsFileInfo *f, int size_width)
 		putchar('-');
 	putchar(' ');
 
-	p = size_tostr(f->size, &size_width, ' ');
+	p = uint64_tostr(f->size, &size_width, ' ');
 	while (*p) {
 		putchar(*p++);
 	}
@@ -567,7 +1547,7 @@ static void print_filelist_row(PcsFileInfo *f, int size_width)
 }
 
 /*打印文件列表*/
-static void print_filelist(PcsFileInfoList *list, int *pFileCount, int *pDirCount, size_t *pTotalSize)
+static void print_filelist(PcsFileInfoList *list, int *pFileCount, int *pDirCount, int64_t *pTotalSize)
 {
 	char tmp[64] = { 0 };
 	int cnt_file = 0,
@@ -575,17 +1555,17 @@ static void print_filelist(PcsFileInfoList *list, int *pFileCount, int *pDirCoun
 		size_width = 1,
 		w;
 	PcsFileInfo *file = NULL;
-	size_t total = 0;
+	int64_t total = 0;
 	PcsFileInfoListIterater iterater;
 
 	pcs_filist_iterater_init(list, &iterater, PcsFalse);
 	while (pcs_filist_iterater_next(&iterater)) {
 		file = iterater.current;
 		w = -1;
-		size_tostr(file->size, &w, ' ');
+		uint64_tostr(file->size, &w, ' ');
 		if (size_width < w)
 			size_width = w;
-		total += (size_t)file->size;
+		total += file->size;
 		if (file->isdir)
 			cnt_dir++;
 		else
@@ -602,7 +1582,7 @@ static void print_filelist(PcsFileInfoList *list, int *pFileCount, int *pDirCoun
 		print_filelist_row(file, size_width);
 	}
 	puts("------------------------------------------------------------------------------");
-	pcs_utils_readable_size(total, tmp, 63, NULL);
+	pcs_utils_readable_size((double)total, tmp, 63, NULL);
 	tmp[63] = '\0';
 	printf("Total: %s, File Count: %d, Directory Count: %d\n", tmp, cnt_file, cnt_dir);
 	putchar('\n');
@@ -615,7 +1595,7 @@ static void print_filelist(PcsFileInfoList *list, int *pFileCount, int *pDirCoun
 static void print_fileinfo(PcsFileInfo *f, const char *prex)
 {
 	if (!prex) prex = "";
-	printf("%sfs_id:\t%llu\n", prex, f->fs_id);
+	printf("%sfs_id:\t%"PRIu64"\n", prex, f->fs_id);
 	printf("%sCategory:\t%d\n", prex, f->category);
 	printf("%sPath:\t\t%s\n", prex, f->path);
 	printf("%sFilename:\t%s\n", prex, f->server_filename);
@@ -626,7 +1606,7 @@ static void print_fileinfo(PcsFileInfo *f, const char *prex)
 	printf("%sIs Dir:\t%s\n", prex, f->isdir ? "Yes" : "No");
 	if (!f->isdir) {
 		printf("%s", prex);
-		print_size("Size:\t\t%s\n", f->size);
+		print_uint64("Size:\t\t%s\n", f->size);
 		printf("%smd5:\t\t%s\n", prex, f->md5);
 		printf("%sdlink:\t\t%s\n", prex, f->dlink);
 	}
@@ -698,6 +1678,14 @@ static char *context2str(ShellContext *context)
 	assert(item);
 	cJSON_AddItemToObject(root, "timeout_retry", item);
 
+	item = cJSON_CreateNumber(context->max_thread);
+	assert(item);
+	cJSON_AddItemToObject(root, "max_thread", item);
+
+	item = cJSON_CreateNumber(context->max_speed_per_thread);
+	assert(item);
+	cJSON_AddItemToObject(root, "max_speed_per_thread", item);
+
 	json = cJSON_Print(root);
 	assert(json);
 
@@ -715,7 +1703,7 @@ static void save_context(ShellContext *context)
 	json = context2str(context);
 	assert(json);
 
-	filename = contextfile();
+	filename = context->contextfile;
 	pf = fopen(filename, "wb");
 	if (!pf) {
 		fprintf(stderr, "Error: Can't open the file: %s\n", filename);
@@ -740,17 +1728,30 @@ static int restore_context(ShellContext *context, const char *filename)
 	}
 	else {
 		if (context->contextfile) pcs_free(context->contextfile);
+#ifdef WIN32
 		context->contextfile = pcs_utils_strdup(filename);
+#else
+		/* Can't open the path that start with '~/'. why? It's not good, but work. */
+		if (filename[0] == '~' && filename[1] == '/') {
+			static char tmp[1024] = { 0 };
+			strcpy(tmp, getenv("HOME"));
+			strcat(tmp, filename + 1);
+			context->contextfile = pcs_utils_strdup(tmp);
+		}
+		else {
+			context->contextfile = pcs_utils_strdup(filename);
+		}
+#endif
 	}
-	filesize = read_file(filename, &filecontent);
+	filesize = read_file(context->contextfile, &filecontent);
 	if (filesize <= 0) {
-		fprintf(stderr, "Error: Can't read the context file (%s).\n", filename, app_name);
+		fprintf(stderr, "Error: Can't read the context file (%s).\n", context->contextfile, app_name);
 		if (filecontent) pcs_free(filecontent);
 		return -1;
 	}
 	root = cJSON_Parse(filecontent);
 	if (!root) {
-		fprintf(stderr, "Error: Broken context file (%s).\n", filename, app_name);
+		fprintf(stderr, "Error: Broken context file (%s).\n", context->contextfile, app_name);
 		pcs_free(filecontent);
 		return -1;
 	}
@@ -847,10 +1848,28 @@ static int restore_context(ShellContext *context, const char *filename)
 		context->timeout_retry = item->valueint ? 1 : 0;
 	}
 
+	item = cJSON_GetObjectItem(root, "max_thread");
+	if (item) {
+		if (((int)item->valueint) < 1) {
+			printf("warning: Invalid context.max_thread, the value should be great than 0, use default value: %d.\n", context->max_thread);
+		}
+		else {
+			context->max_thread = (int)item->valueint;
+		}
+	}
+
+	item = cJSON_GetObjectItem(root, "max_speed_per_thread");
+	if (item) {
+		if (((int)item->valueint) < 0) {
+			printf("warning: Invalid context.max_speed_per_thread, the value should be >= 0, use default value: %d.\n", context->max_speed_per_thread);
+		}
+		else {
+			context->max_speed_per_thread = (int)item->valueint;
+		}
+	}
+
 	cJSON_Delete(root);
 	pcs_free(filecontent);
-	if (context->contextfile) pcs_free(context->contextfile);
-	context->contextfile = pcs_utils_strdup(filename);
 	return 0;
 }
 
@@ -871,6 +1890,8 @@ static void init_context(ShellContext *context, struct args *arg)
 	context->secure_enable = 0;
 
 	context->timeout_retry = 1;
+	context->max_thread = 1;
+	context->max_speed_per_thread = 0;
 }
 
 /*释放上下文*/
@@ -881,60 +1902,32 @@ static void free_context(ShellContext *context)
 	if (context->workdir) pcs_free(context->workdir);
 	if (context->list_sort_name) pcs_free(context->list_sort_name);
 	if (context->list_sort_direction) pcs_free(context->list_sort_direction);
-	if (context->pcs) pcs_destroy(context->pcs);
 	if (context->secure_method) pcs_free(context->secure_method);
 	if (context->secure_key) pcs_free(context->secure_key);
 	if (context->contextfile) pcs_free(context->contextfile);
 	memset(context, 0, sizeof(ShellContext));
 }
 
-/*初始化PCS的安全选项*/
-static void init_pcs_secure(ShellContext *context)
-{
-	int method = 0;
-	if (context->secure_method && context->secure_method[0]) {
-		if (!strcmp(context->secure_method, "aes-cbc-128")) {
-			method = PCS_SECURE_AES_CBC_128;
-		}
-		else if (!strcmp(context->secure_method, "aes-cbc-192")) {
-			method = PCS_SECURE_AES_CBC_192;
-		}
-		else if (!strcmp(context->secure_method, "aes-cbc-256")) {
-			method = PCS_SECURE_AES_CBC_256;
-		}
-		else if (!strcmp(context->secure_method, "plaintext")) {
-			method = PCS_SECURE_PLAINTEXT;
-		}
-	}
-	if (method){
-		pcs_setopts(context->pcs,
-			PCS_OPTION_SECURE_METHOD, (void *)((long)method),
-			PCS_OPTION_SECURE_KEY, context->secure_key,
-			PCS_OPTION_SECURE_ENABLE, context->secure_enable ? ((void *)((long)PcsTrue)) : ((void *)((long)PcsFalse)),
-			PCS_OPTION_END);
-	}
-	else {
-		pcs_setopts(context->pcs,
-			PCS_OPTION_SECURE_METHOD, NULL,
-			PCS_OPTION_SECURE_KEY, NULL,
-			PCS_OPTION_SECURE_ENABLE, ((void *)((long)PcsFalse)),
-			PCS_OPTION_END);
-	}
-}
-
 /*初始化PCS*/
-static void init_pcs(ShellContext *context)
+static Pcs *create_pcs(ShellContext *context)
 {
-	context->pcs = pcs_create(context->cookiefile);
-	pcs_setopt(context->pcs, PCS_OPTION_CAPTCHA_FUNCTION, (void *)&verifycode);
-	pcs_setopts(context->pcs,
+	Pcs *pcs = pcs_create(context->cookiefile);
+	if (!pcs) return NULL;
+	pcs_setopt(pcs, PCS_OPTION_CAPTCHA_FUNCTION, (void *)&verifycode);
+	pcs_setopt(pcs, PCS_OPTION_CAPTCHA_FUNCTION_DATA, (void *)context);
+	pcs_setopts(pcs,
 		PCS_OPTION_PROGRESS_FUNCTION, (void *)&upload_progress,
 		PCS_OPTION_PROGRESS, (void *)((long)PcsFalse),
 		PCS_OPTION_USAGE, (void *)USAGE,
 		//PCS_OPTION_TIMEOUT, (void *)((long)TIMEOUT),
 		PCS_OPTION_CONNECTTIMEOUT, (void *)((long)CONNECTTIMEOUT),
 		PCS_OPTION_END);
-	init_pcs_secure(context);
+	return pcs;
+}
+
+static void destroy_pcs(Pcs *pcs)
+{
+	pcs_destroy(pcs);
 }
 
 #pragma endregion
@@ -1070,7 +2063,7 @@ static void usage_echo()
 static void usage_encode()
 {
 	version();
-	printf("\nUsage: %s encode [-deh] <src> <dst>\n", app_name);
+	printf("\nUsage: %s encode [-defh] <src> <dst>\n", app_name);
 	printf("\nDescription:\n");
 	printf("  Encrypt/decrypt the file. Default option is '-d'\n");
 	printf("\nOptions:\n");
@@ -1278,12 +2271,16 @@ static void usage_set()
 	printf("  -----------------------------------------------\n");
 	printf("  captcha_file         String     not null\n");
 	printf("  cookie_file          String     not null\n");
-	printf("  list_page_size       UInt       >0\n");
+	printf("  list_page_size       UInt       > 0\n");
 	printf("  list_sort_direction  Enum       asc|desc\n");
 	printf("  list_sort_name       Enum       name|time|size\n");
 	printf("  secure_enable        Boolean    true|false\n");
 	printf("  secure_key           String     not null when 'secure_method' is not 'plaintext'\n");
 	printf("  secure_method        Enum       plaintext|aes-cbc-128|aes-cbc-192|aes-cbc-256\n");
+	printf("  secure_method        Enum       plaintext|aes-cbc-128|aes-cbc-192|aes-cbc-256\n");
+	printf("  timeout_retry        Boolean    true|false. \n");
+	printf("  max_thread           UInt       > 0 and < %d. The max number of thread that allow create.\n", MAX_THREAD_NUM);
+	printf("  max_speed_per_thread Int        >= 0. The max speed in KiB per thread.\n");
 	printf("\nSamples:\n");
 	printf("  %s set -h\n", app_name);
 	printf("  %s set --cookie_file=\"/tmp/pcs.cookie\"\n", app_name);
@@ -1400,40 +2397,40 @@ static void usage()
 	version();
 	printf("\nUsage: %s command [options] [arg1|arg2...]\n", app_name);
 	printf("\nDescription:\n");
-	printf("  The %s is client of baidu net disk. It supplied many functions, \n"
-		"  which can manage baidu net disk on terminal, such as ls, cp, rm, \n"
-		"  mv, rename, download, upload, search and so on. \n"
-		"  The %s provided AES encryption, which can protected your data.\n", 
-		app_name, app_name, app_name);
+	printf("  The %s is client of baidu net disk. It supplied many functions, \n", app_name);
+	printf("  which can manage baidu net disk on terminal, such as ls, cp, rm, \n");
+	printf("  mv, rename, download, upload, search and so on. \n");
+	printf("  The %s provided AES encryption, which can protected your data.\n", app_name);
+	printf("  The %s is open source, and published on MIT. \n", app_name);
+	printf("  Please see https://github.com/GangZhuo/baidupcs. \n");
 	printf("\nOptions:\n");
 	printf("  --context=<file path>  Specify context.\n");
-	printf("\nCommands:\n"
-		"  cat      Print the file content\n"
-		"  cd       Change the work directory\n"
-		"  copy     Copy the file|directory\n"
-		"  compare  Print the differents between local and net disk\n"
-		"  context  Print the context\n"
-		"  download Download the file\n"
-		"  echo     Write the text into net disk file\n"
-		"  encode   Encrypt/decrypt the file\n"
-		"  help     Print the usage\n"
-		"  list     List the directory\n"
-		"  login    Login\n"
-		"  logout   Logout\n"
-		"  meta     Print the file|directory meta information\n"
-		"  mkdir    Make a new directory\n"
-		"  move     Move the file|directory into other file|directory\n"
-		"  pwd      Print the current work directory\n"
-		"  quota    Print the quota\n"
-		"  remove   Remove the file|directory\n"
-		"  rename   Rename the file|directory\n"
-		"  set      Change the context, you can print the context by 'context' command\n"
-		"  search   Search the files in the specify directory\n"
-		"  synch    Synch between local and net disk. You can 'compare' first.\n"
-		"  upload   Upload the file\n"
-		"  version  Print the version\n"
-		"  who      Print the current user\n"
-		);
+	printf("\nCommands:\n");
+	printf("  cat      Print the file content\n");
+	printf("  cd       Change the work directory\n");
+	printf("  copy     Copy the file|directory\n");
+	printf("  compare  Print the differents between local and net disk\n");
+	printf("  context  Print the context\n");
+	printf("  download Download the file\n");
+	printf("  echo     Write the text into net disk file\n");
+	printf("  encode   Encrypt/decrypt the file\n");
+	printf("  help     Print the usage\n");
+	printf("  list     List the directory\n");
+	printf("  login    Login\n");
+	printf("  logout   Logout\n");
+	printf("  meta     Print the file|directory meta information\n");
+	printf("  mkdir    Make a new directory\n");
+	printf("  move     Move the file|directory into other file|directory\n");
+	printf("  pwd      Print the current work directory\n");
+	printf("  quota    Print the quota\n");
+	printf("  remove   Remove the file|directory\n");
+	printf("  rename   Rename the file|directory\n");
+	printf("  set      Change the context, you can print the context by 'context' command\n");
+	printf("  search   Search the files in the specify directory\n");
+	printf("  synch    Synch between local and net disk. You can 'compare' first.\n");
+	printf("  upload   Upload the file\n");
+	printf("  version  Print the version\n");
+	printf("  who      Print the current user\n");
 	printf("Use '%s <command> -h' to print the details of the command. \n", app_name);
 	printf("Sample: \n");
 	printf("  %s help\n", app_name);
@@ -1454,9 +2451,10 @@ static int set_cookiefile(ShellContext *context, const char *val)
 	if (context->cookiefile) pcs_free(context->cookiefile);
 	context->cookiefile = pcs_utils_strdup(val);
 	if (context->pcs) {
-		pcs_destroy(context->pcs);
-		context->pcs = NULL;
-		init_pcs(context);
+		Pcs *pcs = create_pcs(context);
+		if (!pcs) return -1;
+		destroy_pcs(context->pcs);
+		context->pcs = pcs;
 	}
 	return 0;
 }
@@ -1524,10 +2522,6 @@ static int set_secure_method(ShellContext *context, const char *val)
 	if (streq(context->secure_method, val, -1)) return 0;
 	if (context->secure_method) pcs_free(context->secure_method);
 	context->secure_method = pcs_utils_strdup(val);
-
-	if (context->pcs) {
-		init_pcs_secure(context);
-	}
 	return 0;
 }
 
@@ -1538,10 +2532,6 @@ static int set_secure_key(ShellContext *context, const char *val)
 	if (streq(context->secure_key, val, -1)) return 0;
 	if (context->secure_key) pcs_free(context->secure_key);
 	context->secure_key = pcs_utils_strdup(val);
-
-	if (context->pcs) {
-		init_pcs_secure(context);
-	}
 	return 0;
 }
 
@@ -1558,9 +2548,56 @@ static int set_secure_enable(ShellContext *context, const char *val)
 	else {
 		return -1;
 	}
-	if (context->pcs) {
-		init_pcs_secure(context);
+	return 0;
+}
+
+/*设置上下文中的timeout_retry值*/
+static int set_timeout_retry(ShellContext *context, const char *val)
+{
+	if (!val || !val[0]) return -1;
+	if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+		context->timeout_retry = 1;
 	}
+	else if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0) {
+		context->timeout_retry = 0;
+	}
+	else {
+		return -1;
+	}
+	return 0;
+}
+
+/*设置上下文中的max_thread值*/
+static int set_max_thread(ShellContext *context, const char *val)
+{
+	const char *p = val;
+	int v;
+	if (!val || !val[0]) return -1;
+	while (*p) {
+		if (*p < '0' || *p > '9')
+			return -1;
+		p++;
+	}
+	v = atoi(val);
+	if (v < 1 || v > MAX_THREAD_NUM) return -1;
+	context->max_thread = v;
+	return 0;
+}
+
+/*设置上下文中的max_speed_per_thread值*/
+static int set_max_speed_per_thread(ShellContext *context, const char *val)
+{
+	const char *p = val;
+	int v;
+	if (!val || !val[0]) return -1;
+	while (*p) {
+		if (*p < '0' || *p > '9')
+			return -1;
+		p++;
+	}
+	v = atoi(val);
+	if (v < 0) return -1;
+	context->max_speed_per_thread = v;
 	return 0;
 }
 
@@ -1628,13 +2665,16 @@ static void rb_print_info(void *a, void *state)
 #pragma endregion
 
 /*创建一个MyMeta*/
-static MyMeta *meta_create(const char *path)
+static MyMeta *meta_create(const char *path, const char *md5)
 {
 	MyMeta *meta;
 	meta = (MyMeta *)pcs_malloc(sizeof(MyMeta));
 	memset(meta, 0, sizeof(MyMeta));
 	if (path) {
 		meta->path = pcs_utils_strdup(path);
+	}
+	if (md5) {
+		meta->md5 = pcs_utils_strdup(md5);
 	}
 	return meta;
 }
@@ -1645,6 +2685,7 @@ static void meta_destroy(MyMeta *meta)
 	if (!meta) return;
 	if (meta->path) pcs_free(meta->path);
 	if (meta->remote_path) pcs_free(meta->remote_path);
+	if (meta->md5) pcs_free(meta->md5);
 	if (meta->msg) pcs_free(meta->msg);
 	pcs_free(meta);
 }
@@ -1659,7 +2700,7 @@ static void onGotLocalFile(LocalFileInfo *info, LocalFileInfo *parent, void *sta
 		return;
 	}
 	fix_unix_path(info->path);
-	meta = meta_create(info->path);
+	meta = meta_create(info->path, NULL);
 	meta->flag |= FLAG_ON_LOCAL;
 	meta->local_mtime = info->mtime;
 	meta->local_isdir = info->isdir;
@@ -2004,9 +3045,15 @@ static int rb_print_meta(void *a, void *state)
 		back_prev_print_line();
 		if (meta->op_st == OP_ST_PROCESSING) meta->op_st = OP_ST_FAIL;
 		if (meta->op_st == OP_ST_FAIL) {
+#ifdef _WIN32
+			fprintf(stderr, "\r");  //清除该行
+			fprintf(stderr, "                                        ");  //清除该行
+			fprintf(stderr, "\r");  //清除该行
+#else
 			fprintf(stderr, "\033[K");  //清除该行
 			fprintf(stderr, "\033[1A"); //先回到上一行
 			fprintf(stderr, "\033[K");  //清除该行
+#endif
 			print_meta_list_row_err(s->first, s->second, s->other, meta);
 		}
 		else {
@@ -2092,10 +3139,235 @@ static PcsBool is_login(ShellContext *context, const char *msg)
 		if (msg[0])
 			printf("%s\n", msg);
 	}
-	else {
+	else if (pcsres == PCS_NOT_LOGIN) {
 		printf("You are not logon or your session is time out. You can login by 'login' command.\n");
 	}
+	else {
+		printf("Error: %s\n", pcs_strerror(context->pcs));
+	}
 	return PcsFalse;
+}
+
+static struct DownloadThreadState *pop_download_threadstate(struct DownloadState *ds)
+{
+	struct DownloadThreadState *ts = NULL;
+	lock_for_download(ds);
+	ts = ds->threads;
+	while (ts && ts->status != DOWNLOAD_STATUS_PENDDING) {
+		ts = ts->next;
+	}
+	if (ts && ts->status == DOWNLOAD_STATUS_PENDDING)
+		ts->status = DOWNLOAD_STATUS_DOWNLOADING;
+	else
+		ts = NULL;
+	unlock_for_download(ds);
+	return ts;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI download_thread(LPVOID params)
+#else
+static void *download_thread(void *params)
+#endif
+{
+	PcsRes res;
+	int dsstatus;
+	struct DownloadState *ds = (struct DownloadState *)params;
+	ShellContext *context = ds->context;
+	struct DownloadThreadState *ts = pop_download_threadstate(ds);
+	Pcs *pcs;
+	if (ts == NULL) {
+		lock_for_download(ds);
+		ds->num_of_running_thread--;
+		unlock_for_download(ds);
+#ifdef _WIN32
+		return (DWORD)0;
+#else
+		return NULL;
+#endif
+	}
+	pcs = create_pcs(context);
+	if (!pcs) {
+		lock_for_download(ds);
+		if (ds->pErrMsg) {
+			if (*(ds->pErrMsg)) pcs_free(*(ds->pErrMsg));
+			(*(ds->pErrMsg)) = pcs_utils_sprintf("Can't create pcs context.");
+		}
+		//ds->status = DOWNLOAD_STATUS_FAIL;
+		ds->num_of_running_thread--;
+		ts->status = DOWNLOAD_STATUS_PENDDING;
+		unlock_for_download(ds);
+#ifdef _WIN32
+		return (DWORD)0;
+#else
+		return NULL;
+#endif
+	}
+	pcs_clone_userinfo(pcs, context->pcs);
+	while (ts) {
+		ts->pcs = pcs;
+		lock_for_download(ds);
+		dsstatus = ds->status;
+		unlock_for_download(ds);
+		if (dsstatus != DOWNLOAD_STATUS_OK) {
+			lock_for_download(ds);
+			ts->status = DOWNLOAD_STATUS_PENDDING;
+			unlock_for_download(ds);
+			break;
+		}
+		pcs_setopts(pcs,
+			PCS_OPTION_DOWNLOAD_WRITE_FUNCTION, &download_write_for_multy_thread,
+			PCS_OPTION_DOWNLOAD_WRITE_FUNCTION_DATA, ts,
+			PCS_OPTION_END);
+		res = pcs_download(pcs, ds->remote_file, convert_to_real_speed(context->max_speed_per_thread), ts->start);
+		if (res != PCS_OK && ts->status != DOWNLOAD_STATUS_OK) {
+			lock_for_download(ds);
+			if (!ds->pErrMsg) {
+				(*(ds->pErrMsg)) = pcs_utils_sprintf("%s", pcs_strerror(pcs));
+			}
+			//ds->status = DOWNLOAD_STATUS_FAIL;
+			unlock_for_download(ds);
+#ifdef _WIN32
+			printf("Download slice failed, retry delay 10 second, tid: %x. message: %s\n", GetCurrentThreadId(), pcs_strerror(pcs));
+#else
+			printf("Download slice failed, retry delay 10 second, tid: %p. message: %s\n", pthread_self(), pcs_strerror(pcs));
+#endif
+			sleep(10); /*10秒后重试*/
+			continue;
+		}
+		lock_for_download(ds);
+		ts->status = DOWNLOAD_STATUS_OK;
+		unlock_for_download(ds);
+		ts = pop_download_threadstate(ds);
+	}
+
+	destroy_pcs(pcs);
+	lock_for_download(ds);
+	ds->num_of_running_thread--;
+	unlock_for_download(ds);
+#ifdef _WIN32
+	return (DWORD)0;
+#else
+	return NULL;
+#endif
+}
+
+static void start_download_thread(struct DownloadState *ds, void **pHandle)
+{
+#ifdef _WIN32
+	DWORD tid;
+	HANDLE thandle;
+	/* hThread = CreateThread (&security_attributes, dwStackSize, ThreadProc, pParam, dwFlags, &idThread)
+	WINBASEAPI HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES,DWORD,LPTHREAD_START_ROUTINE,PVOID,DWORD,PDWORD);
+	第一个参数是指向SECURITY_ATTRIBUTES型态的结构的指针。在Windows 98中忽略该参数。在Windows NT中，它被设为NULL。
+	第二个参数是用于新线程的初始堆栈大小，默认值为0。在任何情况下，Windows根据需要动态延长堆栈的大小。
+	第三个参数是指向线程函数的指标。函数名称没有限制，但是必须以下列形式声明:DWORD WINAPI ThreadProc (PVOID pParam) ;
+	第四个参数为传递给ThreadProc的参数。这样主线程和从属线程就可以共享数据。
+	第五个参数通常为0，但当建立的线程不马上执行时为旗标
+	第六个参数是一个指针，指向接受执行绪ID值的变量
+	*/
+	thandle = CreateThread(NULL, 0, download_thread, (LPVOID)ds, 0, &tid); // 建立线程
+	if (pHandle) *pHandle = thandle;
+	if (!thandle) {
+		printf("Error: Can't create download thread.\n");
+		lock_for_download(ds);
+		ds->num_of_running_thread--;
+		unlock_for_download(ds);
+	}
+#else
+	int err;
+	pthread_t main_tid;
+	err = pthread_create(&main_tid, NULL, download_thread, ds);
+	if (err) {
+		printf("Error: Can't create download thread.\n");
+		lock_for_download(ds);
+		ds->num_of_running_thread--;
+		unlock_for_download(ds);
+	}
+#endif
+}
+
+static int restore_download_state(struct DownloadState *ds, const char *tmp_local_path, int *pendding_count)
+{
+	LocalFileInfo *tmpFileInfo;
+	int64_t tmp_file_size = 0;
+	tmpFileInfo = GetLocalFileInfo(tmp_local_path);
+	if (tmpFileInfo) {
+		tmp_file_size = tmpFileInfo->size;
+		DestroyLocalFileInfo(tmpFileInfo);
+	}
+
+	if ((tmp_file_size >= ds->file_size + 4 + sizeof(struct DownloadThreadState))) {
+		FILE *pf;
+		int magic;
+		int thread_count = 0;
+		struct DownloadThreadState *ts, *tail = NULL;
+		curl_off_t left_size = 0;
+		pf = fopen(tmp_local_path, "rb");
+		if (!pf) return -1;
+		if (fseeko(pf, ds->file_size, SEEK_SET)) {
+			fclose(pf);
+			return -1;
+		}
+		if (fread(&magic, 4, 1, pf) != 1) {
+			fclose(pf);
+			return -1;
+		}
+		if (magic != THREAD_STATE_MAGIC) {
+			fclose(pf);
+			return -1;
+		}
+		if (pendding_count) (*pendding_count) = 0;
+		while(1) {
+			ts = (struct DownloadThreadState *) pcs_malloc(sizeof(struct DownloadThreadState));
+			if (fread(ts, sizeof(struct DownloadThreadState), 1, pf) != 1) {
+				pcs_free(ts);
+				break;
+			}
+			ts->ds = ds;
+			//printf("%d: ", thread_count);
+			if (ts->status != DOWNLOAD_STATUS_OK) {
+				ts->status = DOWNLOAD_STATUS_PENDDING;
+				if (pendding_count) (*pendding_count)++;
+				//printf("*");
+			}
+			//printf("%d/%d\n", (int)ts->start, (int)ts->end);
+			left_size += (ts->end - ts->start);
+			if (tail == NULL) {
+				ds->threads = tail = ts;
+			}
+			else {
+				tail->next = ts;
+				tail = ts;
+			}
+			thread_count++;
+			ts->tid = thread_count;
+			if (!ts->next) {
+				ts->next = NULL;
+				break;
+			}
+			ts->next = NULL;
+		}
+		fclose(pf);
+		ds->resume_from = ds->file_size - left_size;
+		ds->num_of_slice = thread_count;
+		return 0;
+	}
+	return -1;
+}
+
+static int create_file(const char *file, int64_t fsize)
+{
+	FILE *pf;
+	pf = fopen(file, "wb");
+	if (!pf) return -1;
+	fclose(pf);
+	if (fsize > 0) {
+		if (truncate(file, fsize)) {
+			return -1;
+		}
+	}
+	return 0;
 }
 
 /*
@@ -2113,13 +3385,21 @@ static PcsBool is_login(ShellContext *context, const char *msg)
  */
 static inline int do_download(ShellContext *context, 
 	const char *local_file, const char *remote_file, time_t remote_mtime,
-	const char *local_basedir, const char *remote_basedir,
+	const char *local_basedir, const char *remote_basedir, const char *md5,
 	char **pErrMsg, int *op_st)
 {
 	PcsRes res;
 	struct DownloadState ds = { 0 };
 	char *local_path, *remote_path, *dir,
 		*tmp_local_path;
+	int secure_method = 0;
+	int64_t fsize = 0;
+
+	init_download_state(&ds);
+
+	ds.context = context;
+	ds.pErrMsg = pErrMsg;
+	ds.status = 0;
 
 	local_path = combin_path(local_basedir, -1, local_file);
 
@@ -2129,90 +3409,309 @@ static inline int do_download(ShellContext *context,
 		if (CreateDirectoryRecursive(dir) != MKDIR_OK) {
 			if (pErrMsg) {
 				if (*pErrMsg) pcs_free(*pErrMsg);
-				(*pErrMsg) = pcs_utils_sprintf("Error: Can't create the directory: %s", dir);
+				(*pErrMsg) = pcs_utils_sprintf("Can't create the directory: %s", dir);
 			}
 			if (op_st) (*op_st) = OP_ST_FAIL;
 			pcs_free(dir);
 			pcs_free(local_path);
+			uninit_download_state(&ds);
 			return -1;
 		}
 		pcs_free(dir);
 	}
 
-	tmp_local_path = (char *)pcs_malloc(strlen(local_path) + strlen(TEMP_FILE_SUFFIX) + 1);
+	tmp_local_path = (char *)pcs_malloc(strlen(local_path) + (md5 ? strlen(md5) + 1 : 0) + strlen(TEMP_FILE_SUFFIX) + 1);
 	strcpy(tmp_local_path, local_path);
-	strcat(tmp_local_path, TEMP_FILE_SUFFIX);
-
-	/*打开文件*/
-	ds.pf = fopen(tmp_local_path, "wb");
-	if (!ds.pf) {
-		if (pErrMsg) {
-			if (*pErrMsg) pcs_free(*pErrMsg);
-			(*pErrMsg) = pcs_utils_sprintf("Error: Can't open or create the temp file: %s\n", tmp_local_path);
-		}
-		if (op_st) (*op_st) = OP_ST_FAIL;
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		pcs_free(local_path);
-		return -1;
+	if (md5) {
+		strcat(tmp_local_path, ".");
+		strcat(tmp_local_path, md5);
 	}
+	strcat(tmp_local_path, TEMP_FILE_SUFFIX);
 
 	dir = combin_net_disk_path(context->workdir, remote_basedir);
 	if (!dir) {
 		if (pErrMsg) {
 			if (*pErrMsg) pcs_free(*pErrMsg);
-			(*pErrMsg) = pcs_utils_sprintf("Error: Can't combin remote path\n");
+			(*pErrMsg) = pcs_utils_sprintf("Can't combin remote path\n");
 		}
 		if (op_st) (*op_st) = OP_ST_FAIL;
 		DeleteFileRecursive(tmp_local_path);
 		pcs_free(tmp_local_path);
 		pcs_free(local_path);
+		uninit_download_state(&ds);
 		return -1;
 	}
 	remote_path = combin_net_disk_path(dir, remote_file);
 	pcs_free(dir);
-	if (!dir) {
+	if (!remote_path) {
 		if (pErrMsg) {
 			if (*pErrMsg) pcs_free(*pErrMsg);
-			(*pErrMsg) = pcs_utils_sprintf("Error: Can't combin remote path\n");
+			(*pErrMsg) = pcs_utils_sprintf("Can't combin remote path\n");
 		}
 		if (op_st) (*op_st) = OP_ST_FAIL;
 		DeleteFileRecursive(tmp_local_path);
 		pcs_free(tmp_local_path);
 		pcs_free(local_path);
+		uninit_download_state(&ds);
 		return -1;
 	}
 
-	/*启动下载*/
-	pcs_setopts(context->pcs,
-		PCS_OPTION_DOWNLOAD_WRITE_FUNCTION, &download_write,
-		PCS_OPTION_DOWNLOAD_WRITE_FUNCTION_DATA, &ds,
-		//PCS_OPTION_TIMEOUT, (void *)((long)(60 * 60)),
-		PCS_OPTION_END);
-	res = pcs_download(context->pcs, remote_path);
-	fclose(ds.pf);
-	//pcs_setopts(context->pcs,
-	//	PCS_OPTION_TIMEOUT, (void *)((long)TIMEOUT),
-	//	PCS_OPTION_END);
-	if (res != PCS_OK) {
-		if (pErrMsg) {
-			if (*pErrMsg) pcs_free(*pErrMsg);
-			(*pErrMsg) = pcs_utils_sprintf("Error: %s. local_path=%s, remote_path=%s\n", 
-				pcs_strerror(context->pcs), tmp_local_path, remote_path);
+	ds.remote_file = remote_path;
+
+	fsize = pcs_get_download_filesize(context->pcs, remote_path);
+	ds.file_size = fsize;
+
+	if (fsize <= 0) {
+		/*启动下载*/
+		/*打开文件*/
+		ds.pf = fopen(tmp_local_path, "wb");
+		if (!ds.pf) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Can't open or create the temp file: %s\n", tmp_local_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			uninit_download_state(&ds);
+			return -1;
 		}
-		if (op_st) (*op_st) = OP_ST_FAIL;
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		pcs_free(local_path);
-		pcs_free(remote_path);
-		return -1;
+		pcs_setopts(context->pcs,
+			PCS_OPTION_DOWNLOAD_WRITE_FUNCTION, &download_write,
+			PCS_OPTION_DOWNLOAD_WRITE_FUNCTION_DATA, &ds,
+			PCS_OPTION_END);
+		res = pcs_download(context->pcs, remote_path, convert_to_real_speed(context->max_speed_per_thread), 0);
+		fclose(ds.pf);
+		if (res != PCS_OK) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("%s. local_path=%s, remote_path=%s\n",
+					pcs_strerror(context->pcs), tmp_local_path, remote_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			//if (!strstr(pcs_strerror(context->pcs), "Timeout"))
+			//	DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			uninit_download_state(&ds);
+			return -1;
+		}
 	}
+	else {
+		struct DownloadThreadState *ts, *tail = NULL;
+		curl_off_t start = 0;
+		const char *mode = "rb+";
+		int slice_count, pendding_slice_count = 0, thread_count, running_thread_count, i, is_success;
+		int64_t slice_size;
+#ifdef _WIN32
+		HANDLE *handles = NULL;
+#endif
+		slice_count = context->max_thread;
+		if (slice_count < 1) slice_count = 1;
+		if (restore_download_state(&ds, tmp_local_path, &pendding_slice_count)) {
+			//分片开始
+			mode = "wb";
+			ds.resume_from = 0;
+			slice_size = fsize / slice_count;
+			if ((fsize % slice_count))
+				slice_size++;
+			if (slice_size <= MIN_SLICE_SIZE)
+				slice_size = MIN_SLICE_SIZE;
+			if (slice_size > MAX_SLICE_SIZE)
+				slice_size = MAX_SLICE_SIZE;
+			slice_count = (int)(fsize / slice_size);
+			if ((fsize % slice_size)) slice_count++;
+
+			for (i = 0; i < slice_count; i++) {
+				ts = (struct DownloadThreadState *) pcs_malloc(sizeof(struct DownloadThreadState));
+				ts->ds = &ds;
+				ts->start = start;
+				start += slice_size;
+				ts->end = start;
+				if (ts->end > ((curl_off_t)fsize)) ts->end = (curl_off_t)fsize;
+				ts->status = DOWNLOAD_STATUS_PENDDING;
+				pendding_slice_count++;
+				ts->tid = i + 1;
+				ts->next = NULL;
+				if (tail == NULL) {
+					ds.threads = tail = ts;
+				}
+				else {
+					tail->next = ts;
+					tail = ts;
+				}
+			}
+			ds.num_of_slice = slice_count;
+			//分片结束
+			//printf("fs: %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %d\n", ds.file_size, ds.file_size + 4 + sizeof(struct DownloadThreadState) * slice_count, slice_size, slice_count);
+			if (create_file(tmp_local_path, ds.file_size + 4 + sizeof(struct DownloadThreadState) * slice_count)) {
+				if (pErrMsg) {
+					if (*pErrMsg) pcs_free(*pErrMsg);
+					(*pErrMsg) = pcs_utils_sprintf("Can't create the temp file: %s, maybe have no disk space.\n", tmp_local_path);
+				}
+				if (op_st) (*op_st) = OP_ST_FAIL;
+				DeleteFileRecursive(tmp_local_path);
+				pcs_free(tmp_local_path);
+				pcs_free(local_path);
+				pcs_free(remote_path);
+				uninit_download_state(&ds);
+				return -1;
+			}
+			mode = "rb+";
+		}
+		/*打开文件*/
+		ds.pf = fopen(tmp_local_path, mode);
+		if (!ds.pf) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Can't open or create the temp file: %s\n", tmp_local_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			uninit_download_state(&ds);
+			return -1;
+		}
+		//保存分片数据
+		printf("Saving slices...\r");
+		fflush(stdout);
+		if (save_thread_states_to_file(ds.pf, ds.file_size, ds.threads)) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Can't save slices into temp file: %s \n", tmp_local_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			fclose(ds.pf);
+			uninit_download_state(&ds);
+			return -1;
+		}
+		fflush(ds.pf);
+
+		printf("Starting threads...\r");
+		fflush(stdout);
+
+		thread_count = pendding_slice_count;
+		if (thread_count > context->max_thread && context->max_thread > 0)
+			thread_count = context->max_thread;
+		ds.num_of_running_thread = thread_count;
+		//printf("\nthread: %d, slice: %d\n", thread_count, ds.num_of_slice);
+#ifdef _WIN32
+		handles = (HANDLE *)pcs_malloc(sizeof(HANDLE) * thread_count);
+		memset(handles, 0, sizeof(HANDLE) * thread_count);
+#endif
+		for (i = 0; i < thread_count; i++) {
+#ifdef _WIN32
+			start_download_thread(&ds, handles + i);
+#else
+			start_download_thread(&ds, NULL);
+#endif
+		}
+
+		/*等待所有运行的线程退出*/
+		while (1) {
+			lock_for_download(&ds);
+			running_thread_count = ds.num_of_running_thread;
+			unlock_for_download(&ds);
+			if (running_thread_count < 1) break;
+			sleep(1);
+		}
+
+		fclose(ds.pf);
+
+#ifdef _WIN32
+		for (i = 0; i < thread_count; i++) {
+			if (handles[i]) {
+				CloseHandle(handles[i]);
+			}
+		}
+		pcs_free(handles);
+#endif
+
+		/*判断是否所有分片都下载完成了*/
+		is_success = 1;
+		ts = ds.threads;
+		while (ts) {
+			if (ts->status != DOWNLOAD_STATUS_OK) {
+				is_success = 0;
+				break;
+			}
+			ts = ts->next;
+		}
+
+		if (!is_success) {
+			if (pErrMsg) {
+				if (!(*pErrMsg))
+					(*pErrMsg) = pcs_utils_sprintf("Download fail.\n");
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			uninit_download_state(&ds);
+			return -1;
+		}
+		if (truncate(tmp_local_path, ds.file_size)) {
+			if (pErrMsg) {
+				if (!(*pErrMsg))
+					(*pErrMsg) = pcs_utils_sprintf("Can't truncate the temp file %s.\n", tmp_local_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			uninit_download_state(&ds);
+			return -1;
+		}
+	}
+
+	uninit_download_state(&ds);
 
 	DeleteFileRecursive(local_path);
-	if (rename(tmp_local_path, local_path)) {
+
+	if (context->secure_enable) {
+		int context_secure_method = get_secure_method(context);
+		if (context_secure_method == PCS_SECURE_AES_CBC_128
+			|| context_secure_method == PCS_SECURE_AES_CBC_192
+			|| context_secure_method == PCS_SECURE_AES_CBC_256) {
+			secure_method = get_file_secure_method(tmp_local_path);
+		}
+	}
+
+	if (secure_method == PCS_SECURE_AES_CBC_128 || secure_method == PCS_SECURE_AES_CBC_192 || secure_method == PCS_SECURE_AES_CBC_256) {
+		if (decrypt_file(tmp_local_path, local_path, context->secure_key, pErrMsg)) {
+			//if (pErrMsg) {
+			//	if (*pErrMsg) pcs_free(*pErrMsg);
+			//	(*pErrMsg) = pcs_utils_sprintf("Error: The file have been download at %s, but can't decrypted to %s.\n"
+			//		" Maybe broken data.", tmp_local_path, local_path);
+			//}
+			if (pErrMsg) {
+				if (!(*pErrMsg))
+					(*pErrMsg) = pcs_utils_sprintf("Can't decrypt the file.\n");
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			//DeleteFileRecursive(tmp_local_path);
+			pcs_free(tmp_local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			return -1;
+		}
+		DeleteFileRecursive(tmp_local_path);
+	}
+	else if (rename(tmp_local_path, local_path)) {
 		if (pErrMsg) {
 			if (*pErrMsg) pcs_free(*pErrMsg);
-			(*pErrMsg) = pcs_utils_sprintf("Error: The file have been download at %s, but can't rename to %s.\n"
+			(*pErrMsg) = pcs_utils_sprintf("The file have been download at %s, but can't rename to %s.\n"
 				" You should be rename manual.", tmp_local_path, local_path);
 		}
 		if (op_st) (*op_st) = OP_ST_FAIL;
@@ -2232,6 +3731,276 @@ static inline int do_download(ShellContext *context,
 	return 0;
 }
 
+
+static struct UploadThreadState *pop_upload_threadstate(struct UploadState *us)
+{
+	struct UploadThreadState *ts = NULL;
+	lock_for_upload(us);
+	ts = us->threads;
+	while (ts && ts->status != UPLOAD_STATUS_PENDDING) {
+		ts = ts->next;
+	}
+	if (ts && ts->status == UPLOAD_STATUS_PENDDING)
+		ts->status = UPLOAD_STATUS_UPLOADING;
+	else
+		ts = NULL;
+	unlock_for_upload(us);
+	return ts;
+}
+
+/*see http://curl.haxx.se/libcurl/c/CURLOPT_READFUNCTION.html */
+static size_t read_slice(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	static char tmp[64];
+	struct UploadThreadState *ts = (struct UploadThreadState*)userdata;
+	struct UploadState *us = ts->us;
+	time_t tm;
+	size_t sz;
+
+	lock_for_upload(us);
+
+	if (ts->start + ts->uploaded_size >= ts->end) {
+		unlock_for_upload(us);
+		return 0;
+	}
+
+	if (fseeko(us->pf, ts->start + ts->uploaded_size, SEEK_SET)) {
+		if (us->pErrMsg && !(*us->pErrMsg)) {
+			(*(us->pErrMsg)) = pcs_utils_sprintf("Can't fseeko().");
+		}
+		us->status = UPLOAD_STATUS_FAIL;
+		unlock_for_upload(us);
+		return CURL_READFUNC_ABORT;
+	}
+	sz = size * nmemb;
+	if (ts->start + ts->uploaded_size + sz > ts->end) {
+		sz = (size_t)(ts->end - ts->start - ts->uploaded_size);
+	}
+	sz = fread(ptr, 1, sz, us->pf);
+	if (sz == 0) {
+		if (us->pErrMsg && !(*us->pErrMsg)) {
+			(*(us->pErrMsg)) = pcs_utils_sprintf("Can't read the file.");
+		}
+		us->status = UPLOAD_STATUS_FAIL;
+		unlock_for_upload(us);
+		return CURL_READFUNC_ABORT;
+	}
+	//printf("%llu - %llu (%llu) \n", (long long)ts->start + ts->uploaded_size, (long long)ts->start + ts->uploaded_size + sz, (long long)sz);
+	us->speed += sz;
+	us->uploaded_size += sz;
+	ts->uploaded_size += sz;
+
+
+	tm = time(&tm);
+	if (tm != us->time) {
+		int64_t left_size = us->file_size - us->uploaded_size;
+		int64_t remain_tm = (us->speed > 0) ? (left_size / us->speed) : 0;
+		us->time = tm;
+		tmp[63] = '\0';
+		printf("\r                                                \r");
+		printf("%s", pcs_utils_readable_size((double)us->uploaded_size, tmp, 63, NULL));
+		printf("/%s \t", pcs_utils_readable_size((double)us->file_size, tmp, 63, NULL));
+		printf("%s/s \t", pcs_utils_readable_size((double)us->speed, tmp, 63, NULL));
+		printf(" %s        ", pcs_utils_readable_left_time(remain_tm, tmp, 63, NULL));
+		printf("\r");
+		fflush(stdout);
+		us->speed = 0;
+	}
+
+	unlock_for_upload(us);
+	return sz;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI upload_thread(LPVOID params)
+#else
+static void *upload_thread(void *params)
+#endif
+{
+	PcsFileInfo *res;
+	int dsstatus;
+	struct UploadState *ds = (struct UploadState *)params;
+	ShellContext *context = ds->context;
+	struct UploadThreadState *ts = pop_upload_threadstate(ds);
+	Pcs *pcs;
+
+	if (ts == NULL) {
+		lock_for_upload(ds);
+		ds->num_of_running_thread--;
+		unlock_for_upload(ds);
+#ifdef _WIN32
+		return (DWORD)0;
+#else
+		return NULL;
+#endif
+	}
+	pcs = create_pcs(context);
+	if (!pcs) {
+		lock_for_upload(ds);
+		if (ds->pErrMsg) {
+			if (*(ds->pErrMsg)) pcs_free(*(ds->pErrMsg));
+			(*(ds->pErrMsg)) = pcs_utils_sprintf("Can't create pcs context.");
+		}
+		//ds->status = DOWNLOAD_STATUS_FAIL;
+		ds->num_of_running_thread--;
+		ts->status = UPLOAD_STATUS_PENDDING;
+		unlock_for_upload(ds);
+#ifdef _WIN32
+		return (DWORD)0;
+#else
+		return NULL;
+#endif
+	}
+	pcs_clone_userinfo(pcs, context->pcs);
+	while (ts) {
+		ts->pcs = pcs;
+		lock_for_upload(ds);
+		dsstatus = ds->status;
+		unlock_for_upload(ds);
+		if (dsstatus != UPLOAD_STATUS_OK) {
+			lock_for_upload(ds);
+			ts->status = UPLOAD_STATUS_PENDDING;
+			unlock_for_upload(ds);
+			break;
+		}
+		ds->uploaded_size -= ts->uploaded_size;
+		ts->uploaded_size = 0;
+
+		res = pcs_upload_slicefile(pcs, &read_slice, ts, (size_t)(ts->end - ts->start));
+		if (!res) {
+			lock_for_upload(ds);
+			if (ds->pErrMsg && !(*ds->pErrMsg)) {
+				(*(ds->pErrMsg)) = pcs_utils_sprintf("%s", pcs_strerror(pcs));
+			}
+			//ds->status = UPLOAD_STATUS_FAIL;
+			unlock_for_upload(ds);
+#ifdef _WIN32
+			printf("Upload slice failed, retry delay 10 second, tid: %x. message: %s\n", GetCurrentThreadId(), pcs_strerror(pcs));
+#else
+			printf("Upload slice failed, retry delay 10 second, tid: %p. message: %s\n", pthread_self(), pcs_strerror(pcs));
+#endif
+			sleep(10); /*10秒后重试*/
+			continue;
+		}
+		lock_for_upload(ds);
+		ts->status = UPLOAD_STATUS_OK;
+		strcpy(ts->md5, res->md5);
+		pcs_fileinfo_destroy(res);
+		save_upload_thread_states_to_file(ds->slice_file, ds->threads);
+		unlock_for_upload(ds);
+		ts = pop_upload_threadstate(ds);
+	}
+
+	destroy_pcs(pcs);
+	lock_for_upload(ds);
+	ds->num_of_running_thread--;
+	unlock_for_upload(ds);
+#ifdef _WIN32
+	return (DWORD)0;
+#else
+	return NULL;
+#endif
+}
+
+static void start_upload_thread(struct UploadState *us, void **pHandle)
+{
+#ifdef _WIN32
+	DWORD tid;
+	HANDLE thandle;
+	/* hThread = CreateThread (&security_attributes, dwStackSize, ThreadProc, pParam, dwFlags, &idThread)
+	WINBASEAPI HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES,DWORD,LPTHREAD_START_ROUTINE,PVOID,DWORD,PDWORD);
+	第一个参数是指向SECURITY_ATTRIBUTES型态的结构的指针。在Windows 98中忽略该参数。在Windows NT中，它被设为NULL。
+	第二个参数是用于新线程的初始堆栈大小，默认值为0。在任何情况下，Windows根据需要动态延长堆栈的大小。
+	第三个参数是指向线程函数的指标。函数名称没有限制，但是必须以下列形式声明:DWORD WINAPI ThreadProc (PVOID pParam) ;
+	第四个参数为传递给ThreadProc的参数。这样主线程和从属线程就可以共享数据。
+	第五个参数通常为0，但当建立的线程不马上执行时为旗标
+	第六个参数是一个指针，指向接受执行绪ID值的变量
+	*/
+	thandle = CreateThread(NULL, 0, upload_thread, (LPVOID)us, 0, &tid); // 建立线程
+	if (pHandle) *pHandle = thandle;
+	if (!thandle) {
+		printf("Error: Can't create download thread.\n");
+		lock_for_upload(us);
+		us->num_of_running_thread--;
+		unlock_for_upload(us);
+	}
+#else
+	int err;
+	pthread_t main_tid;
+	err = pthread_create(&main_tid, NULL, upload_thread, us);
+	if (err) {
+		printf("Error: Can't create download thread.\n");
+		lock_for_upload(us);
+		us->num_of_running_thread--;
+		unlock_for_upload(us);
+	}
+#endif
+}
+
+static int restore_upload_state(struct UploadState *us, const char *slice_local_path, int *pendding_count)
+{
+	LocalFileInfo *tmpFileInfo;
+	int64_t slice_file_size = 0;
+	FILE *pf;
+	int magic;
+	int thread_count = 0;
+	struct UploadThreadState *ts, *tail = NULL;
+
+	tmpFileInfo = GetLocalFileInfo(slice_local_path);
+	if (!tmpFileInfo) {
+		return -1;
+	}
+	slice_file_size = tmpFileInfo->size;
+	DestroyLocalFileInfo(tmpFileInfo);
+
+	pf = fopen(slice_local_path, "rb");
+	if (!pf) return -1;
+	if (fread(&magic, 4, 1, pf) != 1) {
+		fclose(pf);
+		return -1;
+	}
+	if (magic != THREAD_STATE_MAGIC) {
+		fclose(pf);
+		return -1;
+	}
+	if (pendding_count) (*pendding_count) = 0;
+	us->uploaded_size = 0;
+	while (1) {
+		ts = (struct UploadThreadState *) pcs_malloc(sizeof(struct UploadThreadState));
+		if (fread(ts, sizeof(struct UploadThreadState), 1, pf) != 1) {
+			pcs_free(ts);
+			break;
+		}
+		ts->us = us;
+		//printf("%d: ", thread_count);
+		if (ts->status != UPLOAD_STATUS_OK) {
+			ts->status = UPLOAD_STATUS_PENDDING;
+			if (pendding_count) (*pendding_count)++;
+			ts->uploaded_size = 0;
+			//printf("*");
+		}
+		us->uploaded_size += ts->uploaded_size;
+		//printf("%d/%d\n", (int)ts->start, (int)ts->end);
+		if (tail == NULL) {
+			us->threads = tail = ts;
+		}
+		else {
+			tail->next = ts;
+			tail = ts;
+		}
+		thread_count++;
+		ts->tid = thread_count;
+		if (!ts->next) {
+			ts->next = NULL;
+			break;
+		}
+		ts->next = NULL;
+	}
+	fclose(pf);
+	us->num_of_slice = thread_count;
+	return 0;
+}
+
 static inline int do_upload(ShellContext *context, 
 	const char *local_file, const char *remote_file, PcsBool is_force,
 	const char *local_basedir, const char *remote_basedir,
@@ -2239,33 +4008,314 @@ static inline int do_upload(ShellContext *context,
 {
 	PcsFileInfo *res = NULL;
 	char *local_path, *remote_path, *dir;
+	int del_local_file = 0;
+	int64_t content_length;
+	char content_md5[33] = { 0 };
 
 	local_path = combin_path(local_basedir, -1, local_file);
 	dir = combin_net_disk_path(context->workdir, remote_basedir);
 	remote_path = combin_net_disk_path(dir, remote_file);
 	pcs_free(dir);
-	pcs_setopts(context->pcs,
-		PCS_OPTION_PROGRESS_FUNCTION, &upload_progress,
-		PCS_OPTION_PROGRESS_FUNCTION_DATE, NULL,
-		PCS_OPTION_PROGRESS, (void *)((long)PcsTrue),
-		//PCS_OPTION_TIMEOUT, (void *)0L,
-		PCS_OPTION_END);
-	res = pcs_upload(context->pcs, remote_path, is_force, local_path);
-	//pcs_setopts(context->pcs,
-	//	PCS_OPTION_TIMEOUT, (void *)((long)TIMEOUT),
-	//	PCS_OPTION_END);
-	if (!res || !res->path || !res->path[0]) {
+
+	if (context->secure_enable) {
+		int context_secure_method = get_secure_method(context);
+		if (context_secure_method == PCS_SECURE_AES_CBC_128
+			|| context_secure_method == PCS_SECURE_AES_CBC_192
+			|| context_secure_method == PCS_SECURE_AES_CBC_256) {
+			int secure_method = 0;
+			secure_method = get_file_secure_method(local_path);
+			if (secure_method != PCS_SECURE_AES_CBC_128
+				&& secure_method != PCS_SECURE_AES_CBC_192
+				&& secure_method != PCS_SECURE_AES_CBC_256) {
+				char *tmp_local_path = (char *)pcs_malloc(strlen(local_path) + strlen(TEMP_FILE_SUFFIX) + 1);
+				strcpy(tmp_local_path, local_path);
+				strcat(tmp_local_path, TEMP_FILE_SUFFIX);
+				if (encrypt_file(local_path, tmp_local_path, context_secure_method, context->secure_key, pErrMsg)) {
+					//if (pErrMsg) {
+					//	if (*pErrMsg) pcs_free(*pErrMsg);
+					//	(*pErrMsg) = pcs_utils_sprintf("Error: can't encrypt the file %s.\n",
+					//		local_path);
+					//}
+					if (op_st) (*op_st) = OP_ST_FAIL;
+					if (res) pcs_fileinfo_destroy(res);
+					pcs_free(tmp_local_path);
+					pcs_free(local_path);
+					pcs_free(remote_path);
+					return -1;
+				}
+				pcs_free(local_path);
+				local_path = tmp_local_path;
+				del_local_file = 1;
+			}
+		}
+	}
+
+	content_length = pcs_local_filesize(context->pcs, local_path);
+	if (content_length < 0) {
 		if (pErrMsg) {
 			if (*pErrMsg) pcs_free(*pErrMsg);
-			(*pErrMsg) = pcs_utils_sprintf("Error: %s. local_path=%s, remote_path=%s\n", 
+			(*pErrMsg) = pcs_utils_sprintf("%s. local_path=%s, remote_path=%s\n",
 				pcs_strerror(context->pcs), local_path, remote_path);
 		}
 		if (op_st) (*op_st) = OP_ST_FAIL;
-		if (res) pcs_fileinfo_destroy(res);
+		if (del_local_file) DeleteFileRecursive(local_path);
 		pcs_free(local_path);
 		pcs_free(remote_path);
 		return -1;
 	}
+
+	if (content_length > PCS_RAPIDUPLOAD_THRESHOLD)
+		res = pcs_rapid_upload(context->pcs, remote_path, is_force, local_path, content_md5, NULL);
+	if (!res && content_length <= MIN_UPLOAD_SLICE_SIZE) {
+		pcs_setopts(context->pcs,
+			PCS_OPTION_PROGRESS_FUNCTION, &upload_progress,
+			PCS_OPTION_PROGRESS_FUNCTION_DATE, NULL,
+			PCS_OPTION_PROGRESS, (void *)((long)PcsTrue),
+			//PCS_OPTION_TIMEOUT, (void *)0L,
+			PCS_OPTION_END);
+		res = pcs_upload(context->pcs, remote_path, is_force, local_path);
+		//pcs_setopts(context->pcs,
+		//	PCS_OPTION_TIMEOUT, (void *)((long)TIMEOUT),
+		//	PCS_OPTION_END);
+		if (!res || !res->path || !res->path[0]) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("%s. local_path=%s, remote_path=%s\n",
+					pcs_strerror(context->pcs), local_path, remote_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			if (res) pcs_fileinfo_destroy(res);
+			if (del_local_file) DeleteFileRecursive(local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			return -1;
+		}
+	}
+	else if (!res) {
+		struct UploadState us = { 0 };
+		struct UploadThreadState *ts, *tail = NULL;
+		curl_off_t start = 0;
+		int slice_count, pendding_slice_count = 0, thread_count, running_thread_count, i, is_success;
+		int64_t slice_size;
+#ifdef _WIN32
+		HANDLE *handles = NULL;
+#endif
+		char *slice_file;
+
+		init_upload_state(&us);
+		us.context = context;
+
+		if (!(content_md5[0])) {
+			if (!pcs_md5_file(context->pcs, local_path, content_md5)) {
+				if (pErrMsg) {
+					if (*pErrMsg) pcs_free(*pErrMsg);
+					(*pErrMsg) = pcs_utils_sprintf("%s. local_path=%s, remote_path=%s\n",
+						pcs_strerror(context->pcs), local_path, remote_path);
+				}
+				if (op_st) (*op_st) = OP_ST_FAIL;
+				if (del_local_file) DeleteFileRecursive(local_path);
+				pcs_free(local_path);
+				pcs_free(remote_path);
+				uninit_upload_state(&us);
+				return -1;
+			}
+		}
+
+		/*打开文件*/
+		us.pf = fopen(local_path, "rb");
+		if (!us.pf) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Can't open the file: %s\n", local_path);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			if (del_local_file) DeleteFileRecursive(local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			uninit_upload_state(&us);
+			return -1;
+		}
+
+		slice_file = (char *)pcs_malloc(strlen(local_path) + 33 + strlen(SLICE_FILE_SUFFIX) + 1);
+		strcpy(slice_file, local_path);
+		strcat(slice_file, ".");
+		strcat(slice_file, content_md5);
+		strcat(slice_file, SLICE_FILE_SUFFIX);
+
+		us.slice_file = slice_file;
+		us.pErrMsg = pErrMsg;
+		us.file_size = content_length;
+		slice_count = context->max_thread;
+		if (slice_count < 1) slice_count = 1;
+		if (restore_upload_state(&us, slice_file, &pendding_slice_count)) {
+			//分片开始
+			us.uploaded_size = 0;
+			slice_size = content_length / slice_count;
+			if ((content_length % slice_count))
+				slice_size++;
+			if (slice_size <= MIN_UPLOAD_SLICE_SIZE)
+				slice_size = MIN_UPLOAD_SLICE_SIZE;
+			if (slice_size > MAX_UPLOAD_SLICE_SIZE)
+				slice_size = MAX_UPLOAD_SLICE_SIZE;
+			slice_count = (int)(content_length / slice_size);
+			if ((content_length % slice_size)) slice_count++;
+			if (slice_count > MAX_UPLOAD_SLICE_COUNT) {
+				slice_count = MAX_UPLOAD_SLICE_COUNT;
+				slice_size = content_length / slice_count;
+				if ((content_length % slice_count))
+					slice_size++;
+				slice_count = (int)(content_length / slice_size);
+				if ((content_length % slice_size)) slice_count++;
+			}
+
+			for (i = 0; i < slice_count; i++) {
+				ts = (struct UploadThreadState *) pcs_malloc(sizeof(struct UploadThreadState));
+				memset(ts, 0, sizeof(struct UploadThreadState));
+				ts->us = &us;
+				ts->start = start;
+				start += slice_size;
+				ts->end = start;
+				if (ts->end >((curl_off_t)content_length)) ts->end = (curl_off_t)content_length;
+				ts->status = UPLOAD_STATUS_PENDDING;
+				pendding_slice_count++;
+				ts->tid = i + 1;
+				ts->next = NULL;
+				if (tail == NULL) {
+					us.threads = tail = ts;
+				}
+				else {
+					tail->next = ts;
+					tail = ts;
+				}
+			}
+			us.num_of_slice = slice_count;
+			//分片结束
+		}
+		//保存分片数据
+		printf("Saving slices...\r");
+		fflush(stdout);
+		if (save_upload_thread_states_to_file(slice_file, us.threads)) {
+			if (pErrMsg) {
+				if (*pErrMsg) pcs_free(*pErrMsg);
+				(*pErrMsg) = pcs_utils_sprintf("Can't save slices into file: %s \n", slice_file);
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			if (del_local_file) DeleteFileRecursive(local_path);
+			DeleteFileRecursive(slice_file);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			pcs_free(slice_file);
+			uninit_upload_state(&us);
+			return -1;
+		}
+
+		printf("Starting threads...\r");
+		fflush(stdout);
+
+		thread_count = pendding_slice_count;
+		if (thread_count > context->max_thread && context->max_thread > 0)
+			thread_count = context->max_thread;
+		us.num_of_running_thread = thread_count;
+		//printf("\nthread: %d, slice: %d\n", thread_count, ds.num_of_slice);
+#ifdef _WIN32
+		handles = (HANDLE *)pcs_malloc(sizeof(HANDLE) * thread_count);
+		memset(handles, 0, sizeof(HANDLE) * thread_count);
+#endif
+		for (i = 0; i < thread_count; i++) {
+#ifdef _WIN32
+			start_upload_thread(&us, handles + i);
+#else
+			start_upload_thread(&us, NULL);
+#endif
+		}
+
+		/*等待所有运行的线程退出*/
+		while (1) {
+			lock_for_upload(&us);
+			running_thread_count = us.num_of_running_thread;
+			unlock_for_upload(&us);
+			if (running_thread_count < 1) break;
+			sleep(1);
+		}
+		fclose(us.pf);
+
+#ifdef _WIN32
+		for (i = 0; i < thread_count; i++) {
+			if (handles[i]) {
+				CloseHandle(handles[i]);
+			}
+		}
+		pcs_free(handles);
+#endif
+
+		/*判断是否所有分片都下载完成了*/
+		is_success = 1;
+		ts = us.threads;
+		while (ts) {
+			if (ts->status != UPLOAD_STATUS_OK) {
+				is_success = 0;
+				break;
+			}
+			ts = ts->next;
+		}
+
+		if (!is_success) {
+			if (pErrMsg) {
+				if (!(*pErrMsg))
+					(*pErrMsg) = pcs_utils_sprintf("Upload fail.\n");
+			}
+			if (op_st) (*op_st) = OP_ST_FAIL;
+			if (del_local_file) DeleteFileRecursive(local_path);
+			pcs_free(local_path);
+			pcs_free(remote_path);
+			pcs_free(slice_file);
+			uninit_upload_state(&us);
+			return -1;
+		}
+		else {
+			//合并文件
+			PcsSList *slist = NULL, *si, *si_tail;
+			ts = us.threads;
+			while (ts) {
+				si = (PcsSList *)pcs_malloc(sizeof(PcsSList));
+				si->string = ts->md5;
+				si->next = NULL;
+				if (slist == NULL) {
+					slist = si_tail = si;
+				}
+				else {
+					si_tail->next = si;
+					si_tail = si;
+				}
+				ts = ts->next;
+			}
+			res = pcs_create_superfile(context->pcs, remote_path, is_force, slist);
+			si = slist;
+			while (si) {
+				si_tail = si;
+				si = si->next;
+				pcs_free(si_tail);
+			}
+			if (!res) {
+				if (pErrMsg) {
+					if ((*pErrMsg)) pcs_free(*pErrMsg);
+					(*pErrMsg) = pcs_utils_sprintf("%s", pcs_strerror(context->pcs));
+				}
+				if (op_st) (*op_st) = OP_ST_FAIL;
+				if (del_local_file) DeleteFileRecursive(local_path);
+				pcs_free(local_path);
+				pcs_free(remote_path);
+				pcs_free(slice_file);
+				uninit_upload_state(&us);
+				return -1;
+			}
+			uninit_upload_state(&us);
+			DeleteFileRecursive(slice_file);
+			pcs_free(slice_file);
+		}
+
+	}
+
 	/*当文件名以.(点号)开头的话，则网盘会自动去除第一个点。以下if语句的目的就是把网盘文件重命名为以点号开头。*/
 	if (res) {
 		char *diskName = pcs_utils_filename(res->path),
@@ -2329,6 +4379,7 @@ static inline int do_upload(ShellContext *context,
 	}
 	if (op_st) (*op_st) = OP_ST_SUCC;
 	if (res) pcs_fileinfo_destroy(res);
+	if (del_local_file) DeleteFileRecursive(local_path);
 	pcs_free(local_path);
 	pcs_free(remote_path);
 	return 0;
@@ -2363,6 +4414,30 @@ static int cmd_cat(ShellContext *context, struct args *arg)
 		return -1;
 	}
 	pcs_free(path);
+
+	if (context->secure_enable) {
+		int context_secure_method = get_secure_method(context);
+		if (context_secure_method == PCS_SECURE_AES_CBC_128
+			|| context_secure_method == PCS_SECURE_AES_CBC_192
+			|| context_secure_method == PCS_SECURE_AES_CBC_256) {
+			int secure_method = get_data_secure_method(res, sz);
+			if (secure_method == PCS_SECURE_AES_CBC_128
+				|| secure_method == PCS_SECURE_AES_CBC_192
+				|| secure_method == PCS_SECURE_AES_CBC_256) {
+				char *buf;
+				size_t bufsz;
+				if (decrypt_data(res, sz, &buf, &bufsz, context->secure_key)) {
+					printf("Error: can't decrypt the data.");
+					return -1;
+				}
+				buf[bufsz] = '\0';
+				printf("%s\n\n", buf);
+				pcs_free(buf);
+				return 0;
+			}
+		}
+	}
+
 	printf("%s\n\n", res);
 	return 0;
 }
@@ -2508,7 +4583,7 @@ static MyMeta *compare_file(const LocalFileInfo *local, const PcsFileInfo *remot
 {
 	MyMeta *meta = NULL;
 
-	meta = meta_create(local->path);
+	meta = meta_create(local->path, NULL);
 	meta->flag |= FLAG_ON_LOCAL;
 	meta->local_mtime = local->mtime;
 	meta->local_isdir = local->isdir;
@@ -2518,6 +4593,9 @@ static MyMeta *compare_file(const LocalFileInfo *local, const PcsFileInfo *remot
 		meta->remote_path = pcs_utils_strdup(remote->path);
 		meta->remote_mtime = remote->server_mtime;
 		meta->remote_isdir = remote->isdir;
+		if (!remote->isdir && remote->md5) {
+			meta->md5 = pcs_utils_strdup(remote->md5);
+		}
 	}
 
 	decide_op(meta);
@@ -2589,13 +4667,19 @@ static int combin_with_remote_dir_files(ShellContext *context, rb_red_blk_tree *
 				meta->remote_path = pcs_utils_strdup(info->path + skip);
 				meta->remote_mtime = info->server_mtime;
 				meta->remote_isdir = info->isdir;
+				if (!info->isdir && info->md5) {
+					meta->md5 = pcs_utils_strdup(info->md5);
+				}
 			}
 			else {
-				meta = meta_create(info->path + skip);
+				meta = meta_create(info->path + skip, NULL);
 				meta->flag |= FLAG_ON_REMOTE;
 				meta->remote_path = pcs_utils_strdup(info->path + skip);
 				meta->remote_mtime = info->server_mtime;
 				meta->remote_isdir = info->isdir;
+				if (!info->isdir && info->md5) {
+					meta->md5 = pcs_utils_strdup(info->md5);
+				}
 				RBTreeInsert(rb, (void *)meta->path, (void *)meta);
 			}
 		}
@@ -2950,7 +5034,7 @@ static int cmd_download(ShellContext *context, struct args *arg)
 
 	if (do_download(context,
 		locPath, meta->path, meta->server_mtime,
-		"", context->workdir,
+		"", context->workdir, meta->md5,
 		&errmsg, NULL)) {
 		fprintf(stderr, "Error: %s\n", errmsg);
 		pcs_fileinfo_destroy(meta);
@@ -2974,6 +5058,10 @@ static int cmd_echo(ShellContext *context, struct args *arg)
 	size_t sz;
 	PcsFileInfo *f;
 	PcsFileInfo *meta;
+	char *buf;
+	size_t bufsz;
+	int need_free = 0;
+
 	if (test_arg(arg, 2, 2, "a", "h", "help", NULL)) {
 		usage_echo();
 		return -1;
@@ -3021,293 +5109,66 @@ static int cmd_echo(ShellContext *context, struct args *arg)
 			pcs_free(path);
 			return -1;
 		}
+		buf = (char *)org;
+		if (context->secure_enable) {
+			int context_secure_method = get_secure_method(context);
+			if (context_secure_method == PCS_SECURE_AES_CBC_128
+				|| context_secure_method == PCS_SECURE_AES_CBC_192
+				|| context_secure_method == PCS_SECURE_AES_CBC_256) {
+				int secure_method = get_data_secure_method(org, len);
+				if (secure_method == PCS_SECURE_AES_CBC_128
+					|| secure_method == PCS_SECURE_AES_CBC_192
+					|| secure_method == PCS_SECURE_AES_CBC_256) {
+					if (decrypt_data(org, len, &buf, &bufsz, context->secure_key)) {
+						printf("Error: can't decrypt the data.");
+						return -1;
+					}
+					buf[bufsz] = '\0';
+					len = bufsz;
+					need_free = 1;
+				}
+			}
+		}
 		//拼接两个字符串
 		t = (char *)pcs_malloc(sz + len + 1);
 		assert(t);
-		memcpy(t, org, len);
+		memcpy(t, buf, len);
 		memcpy(t + len, text, sz + 1);
 		sz += len;
+		if (need_free) pcs_free(buf);
 	}
 	else {
 		t = (char *)text;
 	}
-	f = pcs_upload_buffer(context->pcs, path, PcsTrue, t, sz);
+	need_free = (t != text) ? 1 : 0;
+	buf = t;
+	if (context->secure_enable) {
+		int context_secure_method = get_secure_method(context);
+		if (context_secure_method == PCS_SECURE_AES_CBC_128
+			|| context_secure_method == PCS_SECURE_AES_CBC_192
+			|| context_secure_method == PCS_SECURE_AES_CBC_256) {
+			if (encrypt_data(t, sz, &buf, &bufsz, context_secure_method, context->secure_key)) {
+				printf("Error: can't encrypt the data.");
+				return -1;
+			}
+			sz = bufsz;
+			if (need_free) pcs_free(t);
+			need_free = 1;
+		}
+	}
+
+	f = pcs_upload_buffer(context->pcs, path, PcsTrue, buf, sz);
 	if (!f) {
 		fprintf(stderr, "Error: %s. \n", pcs_strerror(context->pcs), path);
 		pcs_free(path);
-		if (t != text) pcs_free(t);
+		if (need_free) pcs_free(buf);
 		return -1;
 	}
 	printf("Success. You can use '%s cat %s' to print the file content.\n", app_name, path);
 	pcs_fileinfo_destroy(f);
 	pcs_free(path);
-	if (t != text) pcs_free(t);
+	if (need_free) pcs_free(buf);
 	return 0;
-}
-
-static int encrypt_file(const char *src, const char *dst, int secure_method, const char *secure_key)
-{
-	MD5_CTX md5;
-	unsigned char md5_value[16], buf[PCS_BUFFER_SIZE], out_buf[PCS_BUFFER_SIZE];
-	FILE *srcFile, *dstFile;
-	char *tmp_local_path;
-	long file_sz, sz, buf_sz;
-	AES_KEY				aes = { 0 };
-	unsigned char		key[AES_BLOCK_SIZE] = { 0 };
-	unsigned char		iv[AES_BLOCK_SIZE] = { 0 };
-	int rc;
-	rc = AES_set_encrypt_key(md5_string_raw(secure_key), secure_method, &aes);
-	if (rc < 0) {
-		fprintf(stderr, "Error: Can't set encrypt key.\n");
-		return -1;
-	}
-	MD5_Init(&md5);
-	srcFile = fopen(src, "rb");
-	if (!srcFile) {
-		fprintf(stderr, "Error: Can't open the source file: %s\n", src);
-		return -1;
-	}
-	tmp_local_path = (char *)pcs_malloc(strlen(dst) + strlen(TEMP_FILE_SUFFIX) + 1);
-	strcpy(tmp_local_path, dst);
-	strcat(tmp_local_path, TEMP_FILE_SUFFIX);
-	dstFile = fopen(tmp_local_path, "wb");
-	if (!dstFile) {
-		fprintf(stderr, "Error: Can't create the temp file: %s\n", tmp_local_path);
-		fclose(srcFile);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-
-	fseek(srcFile, 0L, SEEK_END);
-	file_sz = ftell(srcFile);
-	fseek(srcFile, 0L, SEEK_SET);
-
-	sz = 0;
-	if (file_sz % AES_BLOCK_SIZE == 0) {
-		sz = file_sz;
-	}
-	else {
-		sz = (file_sz / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-	}
-	int2Buffer(PCS_AES_MAGIC, buf);
-	int2Buffer(secure_method, &buf[4]);
-	int2Buffer((int)(sz - file_sz), &buf[8]);
-	int2Buffer(0, &buf[12]);
-	sz = fwrite(buf, 1, 16, dstFile);
-	if (sz != 16) {
-		fprintf(stderr, "Error: Write data to %s error. \n", dst);
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-
-	while ((sz = fread(buf, 1, PCS_BUFFER_SIZE, srcFile)) > 0) {
-		MD5_Update(&md5, buf, sz);
-		if ((sz % AES_BLOCK_SIZE) != 0) {
-			buf_sz = (sz / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-			memset(&buf[sz], 0, buf_sz - sz);
-		}
-		else {
-			buf_sz = sz;
-		}
-		// encrypt (iv will change)
-		AES_cbc_encrypt(buf, out_buf, buf_sz, &aes, iv, AES_ENCRYPT);
-		sz = fwrite(out_buf, 1, buf_sz, dstFile);
-		if (sz != buf_sz) {
-			fprintf(stderr, "Error: Write data to %s error. \n", dst);
-			fclose(srcFile);
-			fclose(dstFile);
-			DeleteFileRecursive(tmp_local_path);
-			pcs_free(tmp_local_path);
-			return -1;
-		}
-	}
-	MD5_Final(md5_value, &md5);
-	sz = fwrite(md5_value, 1, 16, dstFile);
-	if (sz != 16) {
-		fprintf(stderr, "Error: Write data to %s error. \n", dst);
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-	fclose(srcFile);
-	fclose(dstFile);
-	DeleteFileRecursive(dst);
-	if (rename(tmp_local_path, dst)) {
-		fprintf(stderr, "Error: The file have been encrypted at %s, but can't rename to %s.\n You should be rename manual.\n", tmp_local_path, dst);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-	pcs_free(tmp_local_path);
-	printf("Success\n");
-	return 0;
-}
-
-static inline void readToAesHead(char *buf, struct PcsAesHead *head)
-{
-	head->magic = readInt(buf);
-	head->bits = readInt(&buf[4]);
-	head->polish = readInt(&buf[8]);
-	head->reserve = readInt(&buf[12]);
-}
-
-int decrypt_file(ShellContext *context, const char *src, const char *dst, const char *secure_key)
-{
-	struct PcsAesHead head = { 0 };
-	MD5_CTX md5;
-	unsigned char md5_value[16], buf[PCS_BUFFER_SIZE], out_buf[PCS_BUFFER_SIZE];
-	char *tmp_local_path;
-	FILE *srcFile, *dstFile;
-	long file_sz, sz, buf_sz;
-	AES_KEY				aes = { 0 };
-	unsigned char		key[AES_BLOCK_SIZE] = { 0 };
-	unsigned char		iv[AES_BLOCK_SIZE] = { 0 };
-	int rc, i;
-	MD5_Init(&md5);
-	srcFile = fopen(src, "rb");
-	if (!srcFile) {
-		fprintf(stderr, "Error: Can't open the source file: %s\n", src);
-		return -1;
-	}
-	tmp_local_path = (char *)pcs_malloc(strlen(dst) + strlen(TEMP_FILE_SUFFIX) + 1);
-	strcpy(tmp_local_path, dst);
-	strcat(tmp_local_path, TEMP_FILE_SUFFIX);
-	dstFile = fopen(tmp_local_path, "wb");
-	if (!dstFile) {
-		fprintf(stderr, "Error: Can't create the temp file: %s\n", tmp_local_path);
-		fclose(srcFile);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-
-	fseek(srcFile, 0L, SEEK_END);
-	file_sz = ftell(srcFile);
-	fseek(srcFile, 0L, SEEK_SET);
-
-	if (file_sz < 32 || ((file_sz - 32) % AES_BLOCK_SIZE) != 0) {
-		fprintf(stderr, "Error: The file is not a encrypt file or is broken.\n");
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-
-	sz = fread(buf, 1, 16, srcFile);
-	if (sz != 16) {
-		fprintf(stderr, "Error: Can't read the source file: %s\n", src);
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-
-	readToAesHead(buf, &head);
-	if (head.magic != PCS_AES_MAGIC || (head.bits != 128 && head.bits != 192 && head.bits != 256)) {
-		fprintf(stderr, "Error: The file is not a encrypt file or is broken.\n");
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-
-	rc = AES_set_decrypt_key(md5_string_raw(secure_key), head.bits, &aes);
-	if (rc < 0) {
-		fprintf(stderr, "Error: Can't set decrypt key.\n");
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-	file_sz -= 32;
-	if (file_sz < PCS_BUFFER_SIZE) {
-		buf_sz = file_sz;
-	}
-	else {
-		buf_sz = PCS_BUFFER_SIZE;
-	}
-	while ((sz = fread(buf, 1, buf_sz, srcFile)) > 0) {
-		if (sz != buf_sz) {
-			fprintf(stderr, "Error: Can't read the source file: %s\n", src);
-			fclose(srcFile);
-			fclose(dstFile);
-			DeleteFileRecursive(tmp_local_path);
-			pcs_free(tmp_local_path);
-			return -1;
-		}
-		AES_cbc_encrypt(buf, out_buf, buf_sz, &aes, iv, AES_DECRYPT);
-		if (file_sz == buf_sz) {
-			buf_sz -= head.polish;
-			file_sz = buf_sz;
-		}
-		MD5_Update(&md5, out_buf, buf_sz);
-		sz = fwrite(out_buf, 1, buf_sz, dstFile);
-		if (sz != buf_sz) {
-			fprintf(stderr, "Error: Write data to %s error. \n", dst);
-			fclose(srcFile);
-			fclose(dstFile);
-			DeleteFileRecursive(tmp_local_path);
-			pcs_free(tmp_local_path);
-			return -1;
-		}
-		file_sz -= buf_sz;
-		if (file_sz == 0) break;
-		if (file_sz < PCS_BUFFER_SIZE) {
-			buf_sz = file_sz;
-		}
-		else {
-			buf_sz = PCS_BUFFER_SIZE;
-		}
-	}
-	MD5_Final(md5_value, &md5);
-	sz = fread(buf, 1, 16, srcFile);
-	if (sz != 16) {
-		fprintf(stderr, "Error: Can't read the source file: %s\n", src);
-		fclose(srcFile);
-		fclose(dstFile);
-		DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-	for (i = 0; i < 16; i++) {
-		if (md5_value[i] != buf[i]) {
-			fprintf(stderr, "Error: Wrong key or broken file\n");
-			fclose(srcFile);
-			fclose(dstFile);
-			DeleteFileRecursive(tmp_local_path);
-			pcs_free(tmp_local_path);
-			return -1;
-		}
-	}
-	fclose(srcFile);
-	fclose(dstFile);
-	DeleteFileRecursive(dst);
-	if (rename(tmp_local_path, dst)) {
-		fprintf(stderr, "Error: The file have been decrypted at %s, but can't rename to %s.\n You should be rename manual.\n", tmp_local_path, dst);
-		//DeleteFileRecursive(tmp_local_path);
-		pcs_free(tmp_local_path);
-		return -1;
-	}
-	pcs_free(tmp_local_path);
-	printf("Success\n");
-	return 0;
-}
-
-static inline int get_secure_method(ShellContext *context)
-{
-	if (!context->secure_method) return -1;
-	if (strcmp(context->secure_method, "aes-cbc-128")) return PCS_SECURE_AES_CBC_128;
-	if (strcmp(context->secure_method, "aes-cbc-192")) return PCS_SECURE_AES_CBC_192;
-	if (strcmp(context->secure_method, "aes-cbc-256")) return PCS_SECURE_AES_CBC_256;
-	return -1;
 }
 
 static int cmd_encode(ShellContext *context, struct args *arg)
@@ -3354,6 +5215,7 @@ static int cmd_encode(ShellContext *context, struct args *arg)
 	}
 
 	if (encrypt) {
+		char *msg = NULL;
 		secure_method = get_secure_method(context);
 		if (secure_method != PCS_SECURE_AES_CBC_128 && secure_method != PCS_SECURE_AES_CBC_192 && secure_method != PCS_SECURE_AES_CBC_256) {
 			fprintf(stderr, "Error: You have not set the encrypt method, the method should be one of [aes-cbc-128|aes-cbc-192|aes-cbc-256]. You can set it by '%s set'.\n", app_name);
@@ -3363,14 +5225,21 @@ static int cmd_encode(ShellContext *context, struct args *arg)
 			fprintf(stderr, "Error: You have not set the encrypt key. You can set it by '%s set'.", app_name);
 			return -1;
 		}
-		return encrypt_file(arg->argv[0], arg->argv[1], secure_method, context->secure_key);
+		if (encrypt_file(arg->argv[0], arg->argv[1], secure_method, context->secure_key, &msg)) {
+			fprintf(stderr, "Error: %s\n", msg);
+			return -1;
+		}
 	}
 	else if (decrypt) {
+		char *msg = NULL;
 		if (!context->secure_key || strlen(context->secure_key) == 0) {
 			fprintf(stderr, "Error: You have not set the encrypt key. You can set it by '%s set'.", app_name);
 			return -1;
 		}
-		return decrypt_file(context, arg->argv[0], arg->argv[1], context->secure_key);
+		if (decrypt_file(arg->argv[0], arg->argv[1], context->secure_key, &msg)) {
+			fprintf(stderr, "Error: %s\n", msg);
+			return -1;
+		}
 	}
 	else {
 		usage_encode();
@@ -3524,7 +5393,7 @@ static int cmd_list(ShellContext *context, struct args *arg)
 	int page_index = 1;
 	char tmp[64] = { 0 };
 	int fileCount = 0, dirCount = 0;
-	size_t totalSize = 0;
+	int64_t totalSize = 0;
 
 	if (test_arg(arg, 0, 1, "h", "help", NULL)) {
 		usage_list();
@@ -3578,7 +5447,7 @@ static int cmd_list(ShellContext *context, struct args *arg)
 	}
 	if (page_index > 1) {
 		puts("\n------------------------------------------------------------------------------");
-		pcs_utils_readable_size(totalSize, tmp, 63, NULL);
+		pcs_utils_readable_size((double)totalSize, tmp, 63, NULL);
 		tmp[63] = '\0';
 		printf("Total Page: %d, Total Size: %s, File Count: %d, Directory Count: %d\n", page_index, tmp, fileCount, dirCount);
 	}
@@ -3603,6 +5472,10 @@ static int cmd_login(ShellContext *context, struct args *arg)
 	if (is_login(context, "")) {
 		printf("You have been logon, you can use 'who' command to print the UID. \n"
 			"You can logout by 'logout' command and then relogin.\n");
+		return -1;
+	}
+	else if (pcs_strerror(context->pcs)) {
+		printf("Error: %s\n", pcs_strerror(context->pcs));
 		return -1;
 	}
 	if (has_optEx(arg, "username", &p) && p && strlen(p) > 0) {
@@ -3644,6 +5517,10 @@ static int cmd_logout(ShellContext *context, struct args *arg)
 		return 0;
 	}
 	if (!is_login(context, "")) {
+		if (pcs_strerror(context->pcs)) {
+			printf("Error: %s\n", pcs_strerror(context->pcs));
+			return -1;
+		}
 		fprintf(stderr, "You are not login, you can use 'login' command to login.\n");
 		return -1;
 	}
@@ -3797,7 +5674,7 @@ static int cmd_quota(ShellContext *context, struct args *arg)
 {
 	const char *opts[] = { "e", NULL };
 	PcsRes pcsres;
-	size_t quota, used;
+	int64_t quota, used;
 	int is_exact = 0;
 	char str[32] = { 0 };
 	if (test_arg(arg, 0, 0, "e", "h", "help", NULL)) {
@@ -3817,9 +5694,9 @@ static int cmd_quota(ShellContext *context, struct args *arg)
 		return -1;
 	}
 	if (is_exact) {
-		printf("%llu Bytes", used);
+		printf("%"PRIu64" Bytes ", used);
 		putchar('/');
-		printf("%llu Bytes  ", quota);
+		printf("%" PRIu64 " Bytes  ", quota);
 	}
 	else {
 		pcs_utils_readable_size((double)used, str, 30, NULL);
@@ -3935,10 +5812,11 @@ static int cmd_rename(ShellContext *context, struct args *arg)
 static int cmd_set(ShellContext *context, struct args *arg)
 {
 	char *val = NULL;
+	int count = 0;
 	if (test_arg(arg, 0, 0, 
 		"cookie_file", "captcha_file", 
 		"list_page_size", "list_sort_name", "list_sort_direction",
-		"secure_method", "secure_key", "secure_enable",
+		"secure_method", "secure_key", "secure_enable", "timeout_retry", "max_thread", "max_speed_per_thread",
 		"h", "help", NULL) && arg->optc == 0) {
 		usage_set();
 		return -1;
@@ -3949,6 +5827,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "cookie_file", &val)) {
+		count++;
 		if (set_cookiefile(context, val)) {
 			usage_set();
 			return -1;
@@ -3956,6 +5835,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "captcha_file", &val)) {
+		count++;
 		if (set_captchafile(context, val)) {
 			usage_set();
 			return -1;
@@ -3963,6 +5843,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "list_page_size", &val)) {
+		count++;
 		if (set_list_page_size(context, val)) {
 			usage_set();
 			return -1;
@@ -3970,6 +5851,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "list_sort_name", &val)) {
+		count++;
 		if (set_list_sort_name(context, val)) {
 			usage_set();
 			return -1;
@@ -3977,6 +5859,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "list_sort_direction", &val)) {
+		count++;
 		if (set_list_sort_direction(context, val)) {
 			usage_set();
 			return -1;
@@ -3984,6 +5867,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "secure_method", &val)) {
+		count++;
 		if (set_secure_method(context, val)) {
 			usage_set();
 			return -1;
@@ -3991,6 +5875,7 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "secure_key", &val)) {
+		count++;
 		if (set_secure_key(context, val)) {
 			usage_set();
 			return -1;
@@ -3998,11 +5883,42 @@ static int cmd_set(ShellContext *context, struct args *arg)
 	}
 
 	if (has_optEx(arg, "secure_enable", &val)) {
+		count++;
 		if (set_secure_enable(context, val)) {
 			usage_set();
 			return -1;
 		}
 	}
+
+	if (has_optEx(arg, "timeout_retry", &val)) {
+		count++;
+		if (set_timeout_retry(context, val)) {
+			usage_set();
+			return -1;
+		}
+	}
+
+	if (has_optEx(arg, "max_thread", &val)) {
+		count++;
+		if (set_max_thread(context, val)) {
+			usage_set();
+			return -1;
+		}
+	}
+
+	if (has_optEx(arg, "max_speed_per_thread", &val)) {
+		count++;
+		if (set_max_speed_per_thread(context, val)) {
+			usage_set();
+			return -1;
+		}
+	}
+
+	if (!count) {
+		usage_set();
+		return -1;
+	}
+
 	printf("Success. You can view context by '%s context'\n", app_name);
 	return 0;
 }
@@ -4093,7 +6009,7 @@ static int synchDownload(MyMeta *meta, struct RBEnumerateState *s, void *state)
 
 	return do_download(s->context, 
 		meta->path, meta->remote_path, meta->remote_mtime, 
-		s->local_basedir, s->remote_basedir,
+		s->local_basedir, s->remote_basedir, meta->md5,
 		&meta->msg, &meta->op_st);
 }
 
@@ -4199,7 +6115,7 @@ static int synchFile(ShellContext *context, compare_arg *arg, MyMeta *meta, void
 		else
 			do_download(context,
 				meta->path, meta->remote_path, meta->remote_mtime,
-				arg->local_file, arg->remote_file,
+				arg->local_file, arg->remote_file, meta->md5,
 				&meta->msg, &meta->op_st);
 		break;
 	}
@@ -4291,36 +6207,45 @@ static int cmd_upload(ShellContext *context, struct args *arg)
 		DestroyLocalFileInfo(local);
 		return -1;
 	}
-	DestroyLocalFileInfo(local);
 	/*检查本地文件 - 结束*/
 
 	//检查是否已经登录
 	if (!is_login(context, NULL)) {
+		DestroyLocalFileInfo(local);
 		return -1;
 	}
 
 	path = combin_net_disk_path(context->workdir, relPath);
 	if (!path) {
 		assert(path);
+		DestroyLocalFileInfo(local);
 		return -1;
 	}
 
 	if (strcmp(path, "/") == 0) {
-		fprintf(stderr, "Error: Can't specify root directory, you should specify the file name.\n");
+		char *tmp = combin_net_disk_path(path, local->filename);
 		pcs_free(path);
-		return -1;
+		path = tmp;
 	}
 
 	/*检查网盘文件 - 开始*/
 	meta = pcs_meta(context->pcs, path);
 	if (meta && meta->isdir) {
-		fprintf(stderr, "Error: The remote file exist, and it is directory. \n");
+		char *tmp = combin_net_disk_path(path, local->filename);
+		pcs_free(path);
+		path = tmp;
+		pcs_fileinfo_destroy(meta);
+		meta = pcs_meta(context->pcs, path);
+	}
+	DestroyLocalFileInfo(local);
+	if (meta && meta->isdir) {
+		fprintf(stderr, "Error: The remote file exist, and it is directory. %s\n", path);
 		pcs_fileinfo_destroy(meta);
 		pcs_free(path);
 		return -1;
 	}
 	else if (meta && !is_force){
-		fprintf(stderr, "Error: The remote file exist. You can specify '-f' to force override.\n");
+		fprintf(stderr, "Error: The remote file exist. You can specify '-f' to force override. %s\n", path);
 		pcs_fileinfo_destroy(meta);
 		pcs_free(path);
 		return -1;
@@ -4539,8 +6464,14 @@ int main(int argc, char *argv[])
 		printf("%s\n", errmsg);
 		pcs_free(errmsg);
 	}
-	init_pcs(&context);
+	context.pcs = create_pcs(&context);
+	if (!context.pcs) {
+		rc = -1;
+		printf("Can't create pcs context.\n");
+		goto exit_main;
+	}
 	rc = exec_cmd(&context, &arg);
+	destroy_pcs(context.pcs);
 	save_context(&context);
 exit_main:
 	free_context(&context);

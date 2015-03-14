@@ -5,6 +5,7 @@
 #ifdef WIN32
 # include <malloc.h>
 # define snprintf _snprintf
+# define vsnprintf _vsnprintf
 #include "openssl_md5.h"
 #else
 # include <alloca.h>
@@ -52,17 +53,19 @@ PCS_API char *pcs_utils_vsprintf(const char *fmt, va_list ap)
     char *buf;
 	va_list ap_try;
 
-    sz = 128;
+    sz = 1024;
     buf = (char*)pcs_malloc(sz);
+try_print:
 	va_copy(ap_try, ap);
-	cnt = vsnprintf(buf, sz, fmt, ap_try);
+	cnt = vsnprintf(buf, sz - 1, fmt, ap_try);
 	va_end(ap_try);
-    if (cnt >= sz) {
+	if (cnt > sz) {
 		pcs_free(buf);
-        buf = (char*)pcs_malloc(cnt + 1);
-        sz = cnt + 1;
-		cnt = vsnprintf(buf, sz, fmt, ap);
+        sz *= 2;
+		buf = (char*)pcs_malloc(sz);
+		goto try_print;
     }
+	if (cnt < 0) return NULL;
 	buf[cnt] = '\0';
 	return buf;
 }
@@ -84,13 +87,32 @@ PCS_API char *pcs_utils_sprintf(const char *fmt, ...)
 PCS_API char* pcs_utils_readable_size(double size/*in bytes*/, char *buf, int buf_size, char *sp)
 {
 	int i = 0;
-	const char* units[] = {"B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"};
+	const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"};
 	while (size > 1024) {
 		size /= 1024;
 		i++;
 	}
 	memset(buf, 0, buf_size);
 	snprintf(buf, buf_size, "%.2f%s%s", (float)size, sp ? sp : "", units[i]);
+	return buf;
+}
+
+/* Human-readable left time */
+PCS_API char* pcs_utils_readable_left_time(int64_t second, char *buf, int buf_size, char *sp)
+{
+	int i = 0;
+	const char* units[] = { "B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB" };
+	int day = (int)(second / (24 * 60 * 60));
+	int hour = (int)((second % (24 * 60 * 60)) / (60 * 60));
+	int minute = (int)(((second % (24 * 60 * 60)) % (60 * 60)) / 60);
+	int sec = (int)(((second % (24 * 60 * 60)) % (60 * 60)) % 60);
+	memset(buf, 0, buf_size);
+	if (day > 0) {
+		snprintf(buf, buf_size, "%d days %.2d:%.2d:%.2d", day, hour, minute, sec);
+	}
+	else {
+		snprintf(buf, buf_size, "%.2d:%.2d:%.2d", hour, minute, sec);
+	}
 	return buf;
 }
 
@@ -259,7 +281,7 @@ PCS_API void int2Buffer(int v, char *buf)
 }
 
 /*int2Buffer的逆过程*/
-PCS_API int readInt(char *buf)
+PCS_API int readInt(const char *buf)
 {
 	unsigned int rc = 0;
 	rc = (unsigned int)(((unsigned char)buf[0]));
@@ -267,4 +289,27 @@ PCS_API int readInt(char *buf)
 	rc = (unsigned int)((rc << 8) | ((unsigned char)buf[2]));
 	rc = (unsigned int)((rc << 8) | ((unsigned char)buf[3]));
 	return rc;
+}
+
+/*
+ * 提取出字符 callback({...}) 中的 {...} 部分 
+ */
+PCS_API char *extract_json_from_callback(char *callback)
+{
+	char *start, *p;
+	start = callback;
+	while ((*start) && ((*start) != '(') && ((*start) != '{')) {
+		start++;
+	}
+	if ((*start) == '{') return start;
+	if ((*start) != '(') return NULL;
+	start++;
+	p = start;
+	while (*p) p++;
+	while ((p >= start) && (*p != ')')) p--;
+	if ((*p) == ')') {
+		*p = '\0';
+		return start;
+	}
+	return NULL;
 }

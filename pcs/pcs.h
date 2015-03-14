@@ -9,15 +9,9 @@
 #include "pcs_slist.h"
 #include "pcs_utils.h"
 
-#define PCS_API_VERSION "v1.0.8"
+#define PCS_API_VERSION "v1.0.11"
 
-#define PCS_SECURE_NONE				((int)0)
-#define PCS_SECURE_PLAINTEXT		((int)1)
-#define PCS_SECURE_AES_CBC_128		((int)128)
-#define PCS_SECURE_AES_CBC_192		((int)192)
-#define PCS_SECURE_AES_CBC_256		((int)256)
-
-#define PCS_AES_MAGIC				(0x41455300)
+#define PCS_RAPIDUPLOAD_THRESHOLD (256 * 1024)
 
 typedef enum PcsOption {
 	PCS_OPTION_END = 0,
@@ -43,12 +37,6 @@ typedef enum PcsOption {
 	PCS_OPTION_PROGRESS_FUNCTION_DATE,
 	/* 设置是否启用下载或上传进度，值为PcsBool类型 */
 	PCS_OPTION_PROGRESS,
-	/* 设置加密|解密方法，类型为INT，可选值：PCS_SECURE_NONE,PCS_SECURE_AES_CBC_128,PCS_SECURE_AES_CBC_192,PCS_SECURE_AES_CBC_256 */
-	PCS_OPTION_SECURE_METHOD,
-	/* 设置加密|解密方法的密钥，类型为string。长度16 */
-	PCS_OPTION_SECURE_KEY,
-	/*禁用或启用安全，值为PcsBool类型。设置为PcsTrue时，启用PCS_OPTION_SECURE_METHOD和PCS_OPTION_SECURE_KEY选项；设置为PcsFalse时，禁用PCS_OPTION_SECURE_METHOD和PCS_OPTION_SECURE_KEY选项*/
-	PCS_OPTION_SECURE_ENABLE,
 	/* 设置USAGE，值为char类型指针 */
 	PCS_OPTION_USAGE,
 	/*设置整个请求的超时时间，值为long类型*/
@@ -115,6 +103,9 @@ PCS_API Pcs pcs_create(const char *cookie_file);
  * 释放Pcs对象
 */
 PCS_API void pcs_destroy(Pcs handle);
+
+/*克隆一份用户的 bdstoken, BDUSS 等信息*/
+PCS_API void pcs_clone_userinfo(Pcs dst, Pcs src);
 
 /*
  * 如果已经登录，
@@ -200,7 +191,7 @@ PCS_API PcsRes pcs_logout(Pcs handle);
  *   used  用于接收已使用值
  * 成功后返回PCS_OK，失败则返回错误编号
 */
-PCS_API PcsRes pcs_quota(Pcs handle, size_t *quota, size_t *used);
+PCS_API PcsRes pcs_quota(Pcs handle, int64_t *quota, int64_t *used);
 
 /*
  * 创建一个目录
@@ -301,7 +292,9 @@ PCS_API const char *pcs_cat(Pcs handle, const char *path, size_t *dstsz);
  * 必须指定写入下载内容的函数，可通过PCS_OPTION_DOWNLOAD_WRITE_FUNCTION选项来指定
  * 成功后返回PCS_OK，失败则返回错误编号
  */
-PCS_API PcsRes pcs_download(Pcs handle, const char *path);
+PCS_API PcsRes pcs_download(Pcs handle, const char *path, curl_off_t max_speed, curl_off_t resume_from);
+
+PCS_API int64_t pcs_get_download_filesize(Pcs handle, const char *path);
 
 /*
  * 把内存中的字节序上传到网盘
@@ -314,8 +307,34 @@ PCS_API PcsRes pcs_download(Pcs handle, const char *path);
  * 使用完成后需调用 pcs_fileinfo_destroy() 方法释放。
  * 失败则返回 NULL。
  */
-PCS_API PcsFileInfo *pcs_upload_buffer(Pcs handle, const char *path, PcsBool overwrite, 
-									   const char *buffer, size_t buffer_size);
+PCS_API PcsFileInfo *pcs_upload_buffer(Pcs handle, const char *path, PcsBool overwrite, const char *buffer, size_t buffer_size);
+
+/*
+* 上传分片数据
+*   buffer     待上传的字节序
+*   buffer_size 字节序的字节大小
+* 成功后，返回PcsFileInfo类型实例，该实例包含网盘中新文件的路径等信息
+* 使用完成后需调用 pcs_fileinfo_destroy() 方法释放。
+* 失败则返回 NULL。
+*/
+PCS_API PcsFileInfo *pcs_upload_slice(Pcs handle, const char *buffer, size_t buffer_size);
+
+/*
+* 上传分片文件
+*   read_func     读取分片文件的方法
+*   userdata	  程序本身不使用该参数，仅原样传递到 read_func 函数中
+*   content_size  待上传分片文件的大小
+* 成功后，返回PcsFileInfo类型实例，该实例包含网盘中新文件的路径等信息
+* 使用完成后需调用 pcs_fileinfo_destroy() 方法释放。
+* 失败则返回 NULL。
+*/
+PCS_API PcsFileInfo *pcs_upload_slicefile(Pcs handle,
+	size_t(*read_func)(void *ptr, size_t size, size_t nmemb, void *userdata),
+	void *userdata,
+	size_t content_size);
+
+/*合并分片*/
+PCS_API PcsFileInfo *pcs_create_superfile(Pcs handle, const char *path, PcsBool overwrite, PcsSList *block_list);
 
 /*
  * 上传文件到网盘
@@ -330,6 +349,37 @@ PCS_API PcsFileInfo *pcs_upload_buffer(Pcs handle, const char *path, PcsBool ove
  */
 PCS_API PcsFileInfo *pcs_upload(Pcs handle, const char *path, PcsBool overwrite, 
 									   const char *local_filename);
+
+/*获取本地文件的大小*/
+PCS_API int64_t pcs_local_filesize(Pcs handle, const char *path);
+
+/*
+ * 计算文件的MD5值
+ *   path		目标文件
+ *   md5        用于接收文件的md5值，长度必须大于等于32
+ */
+PCS_API PcsBool pcs_md5_file(Pcs handle, const char *path, char *md5);
+
+/*
+* 计算文件的MD5值，仅从文件offset偏移处开始计算，并仅计算 length 长度的数据。
+*   path		目标文件
+*   md5        用于接收文件的md5值，长度必须大于等于32
+*/
+PCS_API PcsBool pcs_md5_file_slice(Pcs handle, const char *path, int64_t offset, int64_t length, char *md5_buf);
+
+
+/*
+ * 快速上传
+ *   path		目标文件
+ *   overwrite  指定是否覆盖原文件，传入PcsTrue则覆盖，传入PcsFalse，则会使用当前日期重命名。
+ *              例，如果文件file.txt以存在，则上传后新的文件自动变更为file20140117.txt
+ *   local_filename 待上传的本地文件
+ *   content_md5    用于接收文件的md5值，长度必须大于等于32。可传入NULL。
+ *   slice_md5      用于接收验证文件的分片的md5值，长度必须大于等于32。可传入NULL。
+ */
+PCS_API PcsFileInfo *pcs_rapid_upload(Pcs handle, const char *path, PcsBool overwrite,
+	const char *local_filename, char *content_md5, char *slice_md5);
+
 /*
  * 获取Cookie 数据。
  * 成功则返回Cookie数据，失败或没有返回NULL
@@ -344,5 +394,7 @@ PCS_API char *pcs_cookie_data(Pcs handle);
 * 返回原始数据的指针。
 */
 PCS_API const char *pcs_req_rawdata(Pcs handle, int *size, const char **encode);
+
+PCS_API double pcs_speed_download(Pcs handle);
 
 #endif
